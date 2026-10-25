@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: whoson
+Version: 0.1.0
+Summary: Live list of devices on your network, with per-device speed limits via a Wi-Fi toll booth
+Requires-Python: >=3.10

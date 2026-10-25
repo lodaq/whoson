@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whoson"
+version = "0.1.0"
+description = "Live list of devices on your network, with per-device speed limits via a Wi-Fi toll booth"
+requires-python = ">=3.10"
+
+[project.scripts]
+whoson = "whoson.cli:main"
+
+[tool.setuptools]
+packages = ["whoson"]

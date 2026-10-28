@@ -2,7 +2,7 @@
 
 import unittest
 
-from whoson import scanner
+import scanner
 
 
 ROUTE_SAMPLE = """\

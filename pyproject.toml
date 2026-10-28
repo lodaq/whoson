@@ -4,12 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whoson"
-version = "0.1.0"
-description = "Live list of devices on your network, with per-device speed limits via a Wi-Fi toll booth"
+version = "0.2.0"
+description = "Who's on my network? A simple window that shows every device live, and caps the speed of the ones that join the laptop's Wi-Fi."
 requires-python = ">=3.10"
 
-[project.scripts]
-whoson = "whoson.cli:main"
-
 [tool.setuptools]
-packages = ["whoson"]
+py-modules = ["main", "helpers", "tollbooth", "commands", "watch",
+              "router", "scanner", "makers", "settings", "speeds"]

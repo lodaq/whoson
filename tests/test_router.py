@@ -8,7 +8,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from whoson import router
+import router
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -98,6 +98,46 @@ class TestDiscovery(unittest.TestCase):
             found = client._discover_objnames("/html/landevices_view.js")
         self.assertEqual(found["homenetwork/lanhosts"], "MultiObj")
         self.assertEqual(found["homenetwork/landevstat"], "SingleObj")
+
+    def test_objname_switched_after_creation(self):
+        """This router's real page does it this way:
+        Atp.HostsController.set("objName", "system/HostInfo")."""
+        client = router.RouterClient("192.168.1.1", "u", "p")
+        with patch.object(client, "_fetch_page",
+                          return_value=fixture("landevices_view.js")):
+            found = client._discover_objnames("/html/landevices_view.js")
+        self.assertIn("system/HostInfo", found)
+
+
+class TestDevicesFromThisFirmware(unittest.TestCase):
+    def test_uses_host_info_and_drops_offline_hosts(self):
+        import json
+        import urllib.error
+        client = router.RouterClient("192.168.1.1", "u", "p")
+        hosts = json.loads(fixture("host_info.json"))
+        asked = []
+
+        def fake_request(path, payload=None):
+            asked.append(path)
+            if path.endswith("system/HostInfo"):
+                return hosts
+            raise urllib.error.HTTPError(path, 404, "not here", None, None)
+
+        with patch.object(client, "_fetch_page",
+                          return_value=fixture("landevices_view.js")), \
+             patch.object(client, "_request", side_effect=fake_request):
+            devices = client.devices()
+
+        active = [h for h in hosts if h.get("Active")]
+        self.assertEqual(len(devices), len(active))    # sleeping ones dropped
+        self.assertTrue(all(d["ip"] and d["mac"] for d in devices))
+        self.assertTrue(all(d["mac"] == d["mac"].lower() for d in devices))
+        # the firmware's "-Wireless"-style suffix is not part of the name
+        self.assertFalse(any(d["name"].endswith(("-Wireless", "-Ethernet"))
+                             for d in devices))
+        # every other (404) candidate may have been tried first, but the
+        # working source was found and used
+        self.assertTrue(any(p.endswith("system/HostInfo") for p in asked))
 
 
 class TestLoginFlow(unittest.TestCase):

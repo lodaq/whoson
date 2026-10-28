@@ -28,6 +28,24 @@ class TestSettingsFile(unittest.TestCase):
         self.assertEqual(loaded["router_user"], "admin")
         self.assertEqual(loaded["router_pass"], "s3cret-pw")
 
+    def test_default_speed_and_saved_preference_survive_reopening(self):
+        self.assertEqual(settings.load()["default_speed"], "50kb/10kb")
+        cfg = settings.load()
+        cfg["lan_alias_ip"] = "192.168.1.253"
+        settings.save(cfg)
+        settings.remember_speed(" 75kb/15kb ")
+        self.assertEqual(settings.load()["default_speed"], "75kb/15kb")
+        self.assertEqual(settings.load()["lan_alias_ip"], "192.168.1.253")
+        with self.assertRaises(ValueError):
+            settings.remember_speed("unfinished/")
+        self.assertEqual(settings.load()["default_speed"], "75kb/15kb")
+
+    def test_invalid_saved_speed_falls_back_to_default(self):
+        cfg = settings.load()
+        cfg["default_speed"] = "nonsense"
+        settings.save(cfg)
+        self.assertEqual(settings.load()["default_speed"], "50kb/10kb")
+
     def test_settings_file_is_owner_only(self):
         settings.save(settings.load())
         mode = stat.S_IMODE(os.stat(self.path).st_mode)

@@ -13,6 +13,8 @@ State ownership, kept deliberately boring:
 """
 
 import glob
+import functools
+import threading
 import ipaddress
 import json
 import os
@@ -29,6 +31,7 @@ from scanner import LIVE_STATES
 
 AP_IFACE = "ap0"
 IFB = "ifb0"
+LAN_IFB = "ifbwhoson"
 CAPS_PATH = os.path.join(settings.CONFIG_DIR, "caps.json")
 
 
@@ -169,14 +172,26 @@ def parse_addr(json_text: str, iface=AP_IFACE) -> str:
 # The gateway itself
 # ---------------------------------------------------------------------------
 
+def lan_locked(fn):
+    @functools.wraps(fn)
+    def locked(self, *args, **kwargs):
+        with self._lan_lock:
+            return fn(self, *args, **kwargs)
+    return locked
+
+
 class TollBooth:
     def __init__(self, cfg: dict, dry: bool = False):
+        self._lan_lock = threading.RLock()
+        self._lan_ready = False
+        self._pcs = {}
         self.cfg = cfg
         self.dry = dry
         self.wifi = pick_wifi_iface() or "wlp111s0"
 
     # -- lifecycle ---------------------------------------------------------
 
+    @lan_locked
     def start(self) -> str:
         """Turn the toll booth on.  Returns a plain-language summary."""
         if not self.dry and not sudo_available():
@@ -226,6 +241,8 @@ class TollBooth:
         run_many(commands.nat_cmds(AP_IFACE), self.dry)
         if not self.dry:
             self.reapply_caps()
+            if self._lan_ready:
+                self.lan_reapply()
         chan_note = f", channel {channel} (shared with your Wi-Fi)" if channel else ""
         return (f"Hotspot '{ssid}' is up on {AP_IFACE}{chan_note}. "
                 f"Password: {psk}. Devices can join it now — point the ones "
@@ -292,6 +309,7 @@ class TollBooth:
             "the hotspot service (hostapd) did not start — check its log with: "
             "sudo journalctl -t hostapd | tail -20")
 
+    @lan_locked
     def stop(self) -> str:
         """Turn the toll booth off.  Safe to run any time, even after
         a crash — every step tolerates already-being-cleaned-up."""
@@ -307,8 +325,8 @@ class TollBooth:
         # the teardown above deleted the shared firewall table and the
         # shared upload meter; cable mode (if in use) must get its own
         # rules back, or cabled PCs lose internet
-        if not self.dry and self._lan_caps_load():
-            run_many(commands.tc_init_cmds(self.wifi, IFB), self.dry)
+        if not self.dry and (self._lan_ready or self._lan_caps_load()):
+            run_many(commands.tc_init_cmds(self.wifi, LAN_IFB), self.dry)
             self.lan_reapply()
         return ("Toll booth stopped. Speed caps and blocks on the hotspot "
                 "are gone; devices that were on it will drift back to the "
@@ -489,6 +507,7 @@ class TollBooth:
 
     LAN_CAPS_PATH = os.path.join(settings.CONFIG_DIR, "lan_caps.json")
 
+    @lan_locked
     def lan_up(self, alias_ip: str = "") -> str:
         """Start metering mode for cabled PCs (no hotspot involved).
 
@@ -498,33 +517,37 @@ class TollBooth:
         """
         if not self.dry and not sudo_available():
             raise RunError("admin rights are needed — run `sudo -v` first")
-        alias = alias_ip or self.cfg.get("lan_alias_ip") or self._free_alias()
+        self._lan_ready = False
+        network = ipaddress.ip_network(scanner.autodetect_subnet(), strict=False)
+        alias = alias_ip or self.cfg.get("lan_alias_ip")
+        if not alias or ipaddress.ip_address(alias) not in network:
+            alias = self._free_alias()
         if not self.dry:
             # remember the address so "Cable mode" knows it is on, and so
-            # the same address is reused next time (the PC's script
-            # expects it never to move)
+            # the same address is reused when it still fits this network
             cfg = settings.load()
             cfg["lan_alias_ip"] = alias
             settings.save(cfg)
             self.cfg["lan_alias_ip"] = alias
-        run_many(commands.forwarding_on_cmds(), self.dry)
+        run_many(commands.lan_forwarding_cmds(self.wifi), self.dry)
         for cmd in commands.lan_alias_cmds(self.wifi, alias):
             run(cmd, dry=self.dry, check=False)
         # meters on the laptop's usual network card; the default bucket
         # is effectively unrestricted, so the laptop's own traffic is
         # never slowed — only filtered flows (the PCs) get buckets
-        for cmd in commands.tc_init_cmds(self.wifi, IFB):
-            run(cmd, dry=self.dry)
+        for cmd in commands.ifb_setup_cmds(LAN_IFB):
+            run(cmd, dry=self.dry, check=False)
+        run_many(commands.tc_init_cmds(self.wifi, LAN_IFB), self.dry)
         if not self.dry:
             self.lan_reapply()
-        return (f"Cable mode is on (the laptop now answers on {alias} too). "
-                f"On each Windows PC, open PowerShell as administrator and run:\n"
-                f"  powershell -ExecutionPolicy Bypass -File point-to-laptop.ps1 "
-                f"-Action install -Gateway {alias}\n"
-                f"(that script switches the PC back to the router by itself "
-                f"whenever this laptop is off.)\n"
-                f"Then type the PC's address in the Cable-PC box and press "
-                f"Cap PC to choose its speed.")
+            if not self.lan_alias():
+                raise RunError("could not assign the cable gateway address")
+            self._lan_ready = True
+        return (f"Cable mode is on (laptop address {alias}). "
+                "Save the Windows installer to a flash drive, double-click "
+                "it on the PC, and accept the administrator prompt once. "
+                "Registered PCs appear in the table; select one and press Cap speed. "
+                "Windows discovers address changes automatically.")
 
     def _free_alias(self) -> str:
         """Pick an address at the top of our own street that nobody answers on."""
@@ -575,81 +598,116 @@ class TollBooth:
     def lan_caps(self) -> dict:
         return self._lan_caps_load()
 
+    @lan_locked
+    def registered_pcs(self):
+        caps = self.lan_caps()
+        return [dict(row, client_id=client, cap=caps.get(f"pc-{client}"))
+                for client, row in self._pcs.items()
+                if time.monotonic()-row["seen"] < 45]
+
+    @lan_locked
+    def expire_pcs(self):
+        expired = [key for key, row in self._pcs.items()
+                   if time.monotonic()-row["seen"] >= 45]
+        for key in expired:
+            del self._pcs[key]
+        if expired and self._lan_ready:
+            self.lan_reapply()
+
+    @lan_locked
+    def register_pc(self, client_id, ip, name, mac):
+        """Called only after authentication; prepare NAT before saying ready."""
+        if not self._lan_ready:
+            return ""
+        network = ipaddress.ip_network(scanner.autodetect_subnet(), strict=False)
+        address = ipaddress.ip_address(ip)
+        if address not in network or ip == self.cfg.get("router_ip"):
+            return ""
+        alias = self.lan_alias()
+        if not alias or ipaddress.ip_address(alias) not in network:
+            # NetworkManager can remove the alias during a reconnect.
+            # Rebuild cable mode and pick a new alias if the subnet changed.
+            self.lan_up()
+            alias = self.lan_alias()
+        if not alias or alias == ip or ipaddress.ip_address(alias) not in network:
+            return ""
+        old = self._pcs.get(client_id)
+        self._pcs[client_id] = dict(ip=ip, name=name, mac=mac, seen=time.monotonic())
+        if old is None or old["ip"] != ip:
+            try:
+                self.lan_reapply()
+            except Exception:
+                self._pcs.pop(client_id, None)  # retry preparation on the next heartbeat
+                raise
+        return alias
+
+    @lan_locked
     def lan_reapply(self) -> None:
-        """(Re)apply every LAN cap: meters + address-sharing + buckets."""
+        """Rebuild NAT for all registered PCs, including uncapped ones."""
         caps = self._lan_caps_load()
         local_subnet = scanner.autodetect_subnet()
-        # one clean sharing chain, then one rule per capped PC
+        resolved = {}
+        clients = self.registered_pcs()
+        for key, cap in caps.items():
+            if key.startswith("pc-"):
+                row = next((r for r in clients if key == f"pc-{r['client_id']}"), None)
+                ip = row["ip"] if row else ""
+            else:
+                ip = key if ":" not in key else self._current_ip_for(key)
+            if ip:
+                resolved[ip] = cap
         for cmd in commands.nft_lan_prepare_cmds(commands.LAN_NAT_CHAIN):
-            run(cmd, dry=self.dry, check=False)
-        for key, (down, up) in sorted(caps.items()):
-            ip = key if ":" not in key else self._current_ip_for(key)
-            if not ip:
-                continue
-            for cmd in commands.lan_nat_cmds(ip, local_subnet):
-                run(cmd, dry=self.dry, check=False)
-            for cmd in commands.tc_limit_cmds(self.wifi, ip, int(down), int(up), IFB):
-                run(cmd, dry=self.dry)
+            run(cmd, dry=self.dry)
+        for ip in sorted(set(resolved) | {r["ip"] for r in clients}):
+            run_many(commands.lan_nat_cmds(ip, local_subnet), self.dry)
+        # Clear old address matches before resolving caps at new addresses.
+        for iface in (self.wifi, LAN_IFB):
+            run(["tc", "filter", "del", "dev", iface, "pref", "1"],
+                dry=self.dry, check=False)
+        for ip, (down, up) in resolved.items():
+            run_many(commands.tc_limit_cmds(self.wifi, ip, int(down), int(up), LAN_IFB), self.dry)
 
-    def lan_cap(self, ip: str, down: int, up: int) -> str:
-        """Cap a cabled PC: down/up in kbit/s (100 KB/s = 800 kbit)."""
-        if not ip:
-            raise RunError("type the PC's address in the Cable-PC box first")
+    @lan_locked
+    def lan_cap(self, ip: str, down: int, up: int, client_id: str = "") -> str:
+        if not ip or down <= 0 or up <= 0:
+            raise RunError("a PC address and positive speeds are required")
         if self.dry:
-            return (f"(dry run) would cap {ip} at {speeds.human_speed(down, up)} "
-                    f"and share the laptop's connection with it")
+            return f"(dry run) would cap {ip} at {speeds.human_speed(down, up)}"
         caps = self._lan_caps_load()
-        caps[ip] = [down, up]
+        caps[f"pc-{client_id}" if client_id else ip] = [down, up]
         self._lan_caps_save(caps)
         self.lan_reapply()
-        return (f"capped {ip} at {speeds.human_speed(down, up)}. Both directions "
-                "are metered here — as soon as the PC points its gateway "
-                f"at this laptop (see the note printed when Cable mode was turned on).")
+        return f"capped PC {ip} at {speeds.human_speed(down, up)}"
 
-    def lan_uncap(self, ip: str) -> str:
+    @lan_locked
+    def lan_uncap(self, ip: str, client_id: str = "") -> str:
         if self.dry:
             return f"(dry run) would remove the LAN cap for {ip}"
         caps = self._lan_caps_load()
-        if ip not in caps:
-            return f"{ip} had no LAN cap"
-        del caps[ip]
+        for key in (f"pc-{client_id}", ip):
+            caps.pop(key, None)
         self._lan_caps_save(caps)
-        # drop every meter filter, this PC's buckets, then rebuild the
-        # remaining rules — deleting the class alone would leave this
-        # PC's filter pointing at nothing (which means: no internet)
-        for iface in (self.wifi, IFB):
-            run(["tc", "filter", "del", "dev", iface, "pref", "1"],
-                dry=self.dry, check=False)
-        for cmd in commands.tc_unlimit_cmds(self.wifi, ip, IFB):
-            run(cmd, dry=self.dry, check=False)
         self.lan_reapply()
-        if self.is_up():
-            self.reapply_caps(force=True)     # ifb0 filters are shared
-        # the address-sharing rule for it can safely stay; it only acts
-        # when the PC actually sends traffic through us
+        for cmd in commands.tc_unlimit_cmds(self.wifi, ip, LAN_IFB):
+            run(cmd, dry=self.dry, check=False)
         return f"LAN speed cap removed for {ip}"
 
+    @lan_locked
     def lan_down(self) -> str:
-        """Stop LAN metering.  PCs fall back to the router on their own
-        (their script notices the laptop is gone and switches back)."""
+        self._lan_ready = False    # stop readiness replies before teardown
+        self._pcs.clear()
         alias = self.cfg.get("lan_alias_ip") or ""
         if alias:
-            for cmd in commands.lan_alias_del_cmds(self.wifi, alias):
-                run(cmd, dry=self.dry, check=False)
+            run_many(commands.lan_alias_del_cmds(self.wifi, alias), self.dry)
         for cmd in (["tc", "qdisc", "del", "dev", self.wifi, "root"],
                     ["tc", "qdisc", "del", "dev", self.wifi, "ingress"]):
             run(cmd, dry=self.dry, check=False)
-        if not self.dry and alias:
+        if not self.dry:
             cfg = settings.load()
             cfg["lan_alias_ip"] = ""
             settings.save(cfg)
             self.cfg["lan_alias_ip"] = ""
-        # ifb0 is shared with the Wi-Fi booth: put its caps back if any
-        if self.is_up():
-            self.reapply_caps(force=True)
-        return ("LAN toll booth off. Meters removed; PCs will drift back "
-                "to the router (their script does it automatically when "
-                "this laptop stops answering).")
+        return "Cable mode off. Windows helpers return to their original router routes."
 
     def block(self, ip: str) -> str:
         run_many(commands.nft_block_cmds(ip), self.dry)

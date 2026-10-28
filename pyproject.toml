@@ -9,5 +9,8 @@ description = "Who's on my network? A simple window that shows every device live
 requires-python = ">=3.10"
 
 [tool.setuptools]
-py-modules = ["main", "helpers", "tollbooth", "commands", "watch",
+py-modules = ["main", "helpers", "companion", "usage", "tollbooth", "commands", "watch",
               "router", "scanner", "makers", "settings", "speeds"]
+
+[tool.setuptools.data-files]
+"share/whoson/windows" = ["windows/point-to-laptop.ps1"]

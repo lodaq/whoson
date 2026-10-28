@@ -1,174 +1,257 @@
-# ==============================================================
-#  point-to-laptop.ps1  —  send this PC's internet through the laptop
-#  For Windows 10 and 11.  Nothing to install; one file.
-#
-#  WHY: only the *path* internet traffic takes can be slowed.  This
-#  script makes the path go:  PC -> your laptop -> router.  Then the
-#  laptop's whoson window caps this PC exactly, like any other device.
-#
-#  SAFE BY DESIGN: every 30 seconds the PC quietly checks "is the
-#  laptop there?"  Laptop on  -> go through the laptop.
-#  Laptop off -> go straight to the router (full speed, always online).
-#
-#  HOW TO USE (once, on the PC):
-#    1. On the laptop: press "Cable mode: on" in the whoson window.
-#       It prints an address like 192.168.1.253 -- that is the laptop.
-#    2. Copy this file to the PC, open PowerShell as Administrator
-#       (right-click Start > Terminal (Admin)) and run:
-#         powershell -ExecutionPolicy Bypass -File point-to-laptop.ps1 -Action install -Gateway 192.168.1.253
-#    3. On the laptop: type the PC's address in the Cable-PC box and
-#       press "Cap PC" to choose its speed.
-#
-#  OTHER ACTIONS:
-#    ... -Action status     show what is currently set
-#    ... -Action remove     undo everything (PC back to stock full speed)
-# ==============================================================
-
+# whoson companion. Save the paired installer on a flash drive,
+# double-click whoson-install.cmd on Windows, and accept UAC once. Windows PowerShell 5.1+.
+# Original default routes stay intact. Temporary IPv4 /1 routes select the
+# laptop while it reports ready. Startup and periodic triggers run as SYSTEM.
 param(
-    [string]$Action  = "install",   # install | apply | status | remove
-    [string]$Gateway = "",          # the laptop's address, e.g. 192.168.1.253
-    [string]$Router  = ""           # the router's address (found automatically)
+    [ValidateSet('install', 'watch', 'apply', 'status', 'remove')]
+    [string]$Action = 'install'
 )
-
-$ErrorActionPreference = "Stop"
-$TaskName = "whoson-point-to-laptop"
-
-# ---- helpers ----------------------------------------------------
-
-function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
-        [Security.Principal.WindowsBuiltInRole]::Administrator)
-}
+$ErrorActionPreference = 'Stop'
+$TaskName = 'whoson-point-to-laptop'
+$InstallDir = Join-Path $env:ProgramData 'whoson'
+$TaskScript = Join-Path $InstallDir 'point-to-laptop.ps1'
+$ConfigPath = Join-Path $InstallDir 'companion.json'
+$StatePath = Join-Path $InstallDir 'routes.json'
+$BundledKey = '__WHOSON_PAIRING_KEY__'
+$Prefixes = @('0.0.0.0/1', '128.0.0.0/1')
 
 function Assert-Admin {
-    if (-not (Test-Admin)) {
-        Write-Host "This needs Administrator. Re-launching with a UAC prompt..." -ForegroundColor Yellow
-        Start-Process powershell.exe -Verb RunAs -ArgumentList @(
-            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"",
-            "-Action", $Action, "-Gateway", $Gateway, "-Router", $Router)
-        exit
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Action {1}' -f $PSCommandPath, $Action
+        $process = Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments -Wait -PassThru
+        exit $process.ExitCode
     }
 }
 
-function Find-Router([string]$Exclude) {
-    # The router is where the PC's current default route points -- but
-    # ignore the laptop itself (on a re-install the route may already
-    # point there; following it would make the "fallback" the laptop).
-    $best = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
-            Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" -and
-                           (-not $Exclude -or $_.NextHop -ne $Exclude) } |
-            Sort-Object RouteMetric | Select-Object -First 1
-    if ($best) {
-        return $best.NextHop.ToString()
-    }
-    return ""
-}
-
-function Set-DefaultRoute($through) {
-    # One default route, pointed at $through.  Deleting all defaults
-    # first keeps Windows from being clever with two of them.
-    route delete 0.0.0.0 mask 0.0.0.0 > $null 2>&1
-    route -p delete 0.0.0.0 mask 0.0.0.0 > $null 2>&1
-    route -p add 0.0.0.0 mask 0.0.0.0 $through metric 1 | Out-Null
-    route add 0.0.0.0 mask 0.0.0.0 $through metric 1 | Out-Null
-}
-
-# ---- actions ----------------------------------------------------
-
-switch ($Action.ToLower()) {
-
-    "install" {
-        if (-not $Gateway) {
-            Write-Host "Which address is the laptop?  On the laptop, press" -ForegroundColor Red
-            Write-Host "'Cable mode: on' in the whoson window -- it prints an" -ForegroundColor Red
-            Write-Host "address like 192.168.1.253.  Then run again with:" -ForegroundColor Red
-            Write-Host "  ... -Action install -Gateway 192.168.1.253" -ForegroundColor Red
-            exit 1
+function Protect-InstallDirectory {
+    if (Test-Path -LiteralPath $InstallDir) {
+        $items = @((Get-Item -LiteralPath $InstallDir)) + @(Get-ChildItem -LiteralPath $InstallDir -Force -Recurse)
+        foreach ($item in $items) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.LinkType) {
+                throw 'The installation folder contains a link; remove it before installing.'
+            }
         }
+    }
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $identity = New-Object Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $InstallDir -AclObject $acl
+    if (Get-ChildItem -LiteralPath $InstallDir -Force) {
+        & icacls.exe "$InstallDir\*" /reset /T /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not protect the installed files.' }
+    }
+}
+
+function Read-Json($path) {
+    if (Test-Path -LiteralPath $path) { return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
+    return $null
+}
+
+function Save-Json($path, $value) {
+    $value | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$path.tmp" -Encoding UTF8
+    Move-Item -LiteralPath "$path.tmp" -Destination $path -Force
+}
+
+function Get-Signature([string]$body, [string]$key) {
+    $bytes = New-Object byte[] 32
+    for ($i = 0; $i -lt 32; $i++) { $bytes[$i] = [Convert]::ToByte($key.Substring($i*2, 2), 16) }
+    $hmac = New-Object Security.Cryptography.HMACSHA256
+    try {
+        $hmac.Key = $bytes
+        return ([BitConverter]::ToString($hmac.ComputeHash([Text.Encoding]::ASCII.GetBytes($body)))).Replace('-', '').ToLowerInvariant()
+    } finally { $hmac.Dispose() }
+}
+
+function Remove-HelperRoutes {
+    $state = Read-Json $StatePath
+    if ($state -and $state.Gateway -and $state.InterfaceIndex) {
+        foreach ($prefix in $Prefixes) {
+            Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $prefix -InterfaceIndex $state.InterfaceIndex `
+                -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq $state.Gateway -and $_.RouteMetric -eq 5 } |
+                Remove-NetRoute -Confirm:$false -ErrorAction Stop
+        }
+    }
+    if (Test-Path -LiteralPath $InstallDir) {
+        Save-Json $StatePath @{ Gateway = ''; InterfaceIndex = 0 }
+    }
+}
+
+function Set-HelperRoutes($gateway, $index) {
+    $state = Read-Json $StatePath
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $index -ErrorAction SilentlyContinue)
+    $complete = @($routes | Where-Object { $_.NextHop -eq $gateway -and $_.RouteMetric -eq 5 -and $_.DestinationPrefix -in $Prefixes }).Count -eq 2
+    if ($state -and $state.Gateway -eq $gateway -and $state.InterfaceIndex -eq $index -and $complete) { return }
+    Remove-HelperRoutes
+    $routes = @(Get-NetRoute -AddressFamily IPv4 -InterfaceIndex $index -ErrorAction SilentlyContinue)
+    # Journal ownership BEFORE adding either route, including crash recovery.
+    foreach ($prefix in $Prefixes) {
+        if ($routes | Where-Object { $_.DestinationPrefix -eq $prefix -and $_.NextHop -eq $gateway }) {
+            throw "An existing route already uses $gateway; refusing to take ownership."
+        }
+    }
+    Save-Json $StatePath @{ Gateway = $gateway; InterfaceIndex = $index }
+    try {
+        foreach ($prefix in $Prefixes) {
+            New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $index -NextHop $gateway `
+                -RouteMetric 5 -PolicyStore ActiveStore | Out-Null
+        }
+    } catch { Remove-HelperRoutes; throw }
+}
+
+function Find-Whoson($config) {
+    # Probe each physical Ethernet interface; never route a VPN or a Wi-Fi
+    # adapter by guessing which interface happens to have the lowest metric.
+    foreach ($adapter in @(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceType -eq 6 })) {
+        foreach ($address in @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 |
+                Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '169.254.*' })) {
+            $ip = [Net.IPAddress]::Parse($address.IPAddress)
+            $mask = [uint32]0
+            for ($bit = 0; $bit -lt $address.PrefixLength; $bit++) { $mask = $mask -bor ([uint32]1 -shl (31-$bit)) }
+            $ipBytes = $ip.GetAddressBytes()
+            [Array]::Reverse($ipBytes)
+            $number = [BitConverter]::ToUInt32($ipBytes, 0)
+            $broadcastBytes = [BitConverter]::GetBytes([uint32]($number -bor (-bnot $mask)))
+            [Array]::Reverse($broadcastBytes)
+            $broadcast = New-Object Net.IPAddress(,$broadcastBytes)
+            $udp = New-Object Net.Sockets.UdpClient
+            try {
+                $udp.Client.Bind((New-Object Net.IPEndPoint($ip, 47832)))
+                $udp.EnableBroadcast = $true
+                $udp.Client.ReceiveTimeout = 1500
+                $nonce = [Guid]::NewGuid().ToString('N')
+                $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                $name = ($env:COMPUTERNAME -replace '[^A-Za-z0-9_.-]', '_')
+                if (-not $name) { $name = 'Windows-PC' }
+                $mac = $adapter.MacAddress.Replace('-', ':').ToLowerInvariant()
+                $body = "discover|1|$stamp|$nonce|$($config.ClientId)|$name|$mac|$($address.IPAddress)"
+                $bytes = [Text.Encoding]::ASCII.GetBytes("$body|$(Get-Signature $body $config.Key)")
+                $endpoint = New-Object Net.IPEndPoint($broadcast, 47831)
+                [void]$udp.Send($bytes, $bytes.Length, $endpoint)
+                $deadline = [DateTime]::UtcNow.AddSeconds(2)
+                while ([DateTime]::UtcNow -lt $deadline) {
+                    $remote = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0)
+                    try { $reply = [Text.Encoding]::ASCII.GetString($udp.Receive([ref]$remote)) }
+                    catch [Net.Sockets.SocketException] { break }
+                    if ($reply.Length -gt 256 -or $remote.Port -ne 47831) { continue }
+                    $parts = $reply.Split('|')
+                    if ($parts.Count -ne 5 -or $parts[0] -ne 'ready' -or $parts[1] -ne '1' -or $parts[2] -ne $nonce) { continue }
+                    $signed = $parts[0..3] -join '|'
+                    if ($parts[4] -cne (Get-Signature $signed $config.Key)) { continue }
+                    $gateway = [Net.IPAddress]::Parse($parts[3])
+                    if ($gateway.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $gateway.Equals($ip)) { continue }
+                    $gatewayBytes = $gateway.GetAddressBytes()
+                    [Array]::Reverse($gatewayBytes)
+                    $gatewayNumber = [BitConverter]::ToUInt32($gatewayBytes, 0)
+                    if (($gatewayNumber -band $mask) -ne ($number -band $mask)) { continue }
+                    return @{ Gateway = $gateway.ToString(); InterfaceIndex = $adapter.ifIndex }
+                }
+            } catch [Net.Sockets.SocketException] {
+                # Adapter disappeared, port in use, or no broadcast route.
+            } finally { $udp.Dispose() }
+        }
+    }
+    return $null
+}
+
+function Invoke-Heartbeat {
+    $config = Read-Json $ConfigPath
+    if (-not $config -or $config.Key -notmatch '^[a-f0-9]{64}$') { throw 'Install a paired helper first.' }
+    $found = Find-Whoson $config
+    if ($found) { Set-HelperRoutes $found.Gateway $found.InterfaceIndex }
+    else { Remove-HelperRoutes }
+    Remove-Item -LiteralPath (Join-Path $InstallDir "last-error.txt") -ErrorAction SilentlyContinue
+}
+
+switch ($Action) {
+    'install' {
         Assert-Admin
-        if (-not $Router) { $Router = Find-Router -Exclude $Gateway }
-        if (-not $Router) {
-            # most home routers live at .1 of the same street as the laptop
-            $Router = ($Gateway -replace '\.\d+$', '.1')
+        if ($BundledKey -notmatch '^[a-f0-9]{64}$') { throw 'Use the paired whoson-install.cmd file saved by the whoson app.' }
+        Protect-InstallDirectory
+        $oldConfig = Read-Json $ConfigPath
+        $clientId = if ($oldConfig -and $oldConfig.ClientId) { $oldConfig.ClientId } else { [Guid]::NewGuid().ToString('N') }
+        $oldTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($oldTask) {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            # Upgrade the old fixed-IP helper without deleting unrelated routes.
+            $oldArgs = $oldTask.Actions[0].Arguments
+            if ($oldArgs -match '-Gateway ([0-9.]+)') {
+                $oldGateway = $Matches[1]
+                foreach ($store in @('ActiveStore', 'PersistentStore')) {
+                    Get-NetRoute -DestinationPrefix '0.0.0.0/0' -PolicyStore $store -ErrorAction SilentlyContinue |
+                        Where-Object { $_.NextHop -eq $oldGateway } | Remove-NetRoute -Confirm:$false
+                }
+                if ($oldArgs -match '-Router ([0-9.]+)') {
+                    $router = $Matches[1]
+                    $address = Find-NetRoute -RemoteIPAddress $router -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress } | Select-Object -First 1
+                    if ($address -and -not (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)) {
+                        New-NetRoute -DestinationPrefix '0.0.0.0/0' -NextHop $router -InterfaceIndex $address.InterfaceIndex -PolicyStore ActiveStore | Out-Null
+                    }
+                }
+            }
         }
-
-        # keep our own copy in a place the user won't move or delete:
-        # the every-30-seconds helper must run even if the downloaded
-        # file is cleaned out of Downloads
-        $InstallDir  = Join-Path $env:ProgramData "whoson"
-        $TaskScript  = Join-Path $InstallDir "point-to-laptop.ps1"
-        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-        Copy-Item -LiteralPath $PSCommandPath -Destination $TaskScript -Force
-
-        # a hidden helper that re-checks every 30 seconds, forever
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        $args_ = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass " +
-                 "-File `"$TaskScript`" -Action apply " +
-                 "-Gateway $Gateway -Router $Router"
-        Register-ScheduledTask -TaskName $TaskName `
-            -Action  (New-ScheduledTaskAction -Execute "powershell.exe" -Argument $args_) `
-            -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-                        -RepetitionInterval (New-TimeSpan -Seconds 30) `
-                        -RepetitionDuration (New-TimeSpan -Days 3650)) `
-            -User "SYSTEM" -RunLevel Highest | Out-Null
-
-        & $TaskScript -Action apply -Gateway $Gateway -Router $Router
-        Write-Host ""
-        Write-Host "Done. This PC now sends its internet through the laptop ($Gateway)." -ForegroundColor Green
-        Write-Host "  laptop on  -> traffic goes through it (the laptop caps this PC)"
-        Write-Host "  laptop off -> traffic falls back to the router ($Router), full speed"
-        Write-Host "Undo any time with:  -Action remove"
-        Write-Host ""
-        Write-Host "Last step: in the laptop's window, type this PC's address" -ForegroundColor Cyan
-        Write-Host "in the Cable-PC box and press Cap PC." -ForegroundColor Cyan
+        Remove-HelperRoutes
+        if ($PSCommandPath -ne $TaskScript) { Copy-Item -LiteralPath $PSCommandPath -Destination $TaskScript -Force }
+        Save-Json $ConfigPath @{ Key = $BundledKey; ClientId = $clientId }
+        Remove-NetFirewallRule -Name 'whoson-discovery' -ErrorAction SilentlyContinue
+        New-NetFirewallRule -Name 'whoson-discovery' -DisplayName 'whoson authenticated LAN discovery' `
+            -Direction Inbound -Action Allow -Protocol UDP -LocalPort 47832 -RemotePort 47831 `
+            -RemoteAddress LocalSubnet -Program "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" | Out-Null
+        $arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Action watch' -f $TaskScript
+        $triggers = @((New-ScheduledTaskTrigger -AtStartup),
+                      (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        Register-ScheduledTask -TaskName $TaskName -Force -User SYSTEM -RunLevel Highest `
+            -Action (New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments) `
+            -Trigger $triggers -Settings $settings | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+        Write-Host 'Installed. Keep cable mode on in whoson. This PC appears in its device list automatically.'
+        Write-Host 'Restarting Windows needs no setup. No ready laptop = original router route.'
     }
-
-    "apply" {
-        # the hidden 30-second heartbeat: pick whoever is actually alive.
-        # Only touch the route when it really needs changing — rewriting
-        # it every 30 seconds would hiccup the PC's internet.
-        if (-not $Gateway -or -not $Router) { exit }
-        $target = if (Test-Connection -ComputerName $Gateway -Count 1 -Quiet) {
-            $Gateway
-        } else {
-            $Router
-        }
-        $best = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
-                Sort-Object RouteMetric | Select-Object -First 1
-        if (-not $best -or $best.NextHop -ne $target) {
-            Set-DefaultRoute $target
-        }
-    }
-
-    "status" {
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        Write-Host ("Helper task : " + $(if ($task) { "installed (checks every 30 s)" } else { "not installed" }))
-        if ($task) {
-            $a = $task.Actions[0].Arguments
-            $gw  = if ($a -match "-Gateway (\S+)")  { $Matches[1] } else { "?" }
-            $rtr = if ($a -match "-Router (\S+)")   { $Matches[1] } else { "?" }
-            Write-Host "Laptop      : $gw"
-            Write-Host "Router      : $rtr"
-            Write-Host ("Laptop seen : " + $(if (Test-Connection -ComputerName $gw -Count 1 -Quiet) { "yes - going through it" } else { "no - going through the router" }))
-        }
-        $best = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
-                Sort-Object RouteMetric | Select-Object -First 1
-        if ($best) { Write-Host "Right now   : default route via $($best.NextHop)" }
-    }
-
-    "remove" {
+    'watch' {
         Assert-Admin
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        route -p delete 0.0.0.0 mask 0.0.0.0 > $null 2>&1
-        route delete 0.0.0.0 mask 0.0.0.0 > $null 2>&1
-        # ask the network's own "hand-out" (DHCP) for a fresh, stock setup
-        ipconfig /renew | Out-Null
-        Write-Host "Everything removed. This PC is back to its stock full speed." -ForegroundColor Green
+        $mutex = New-Object Threading.Mutex($false, 'Global\whoson-companion')
+        $owned = $false
+        try {
+            try { $owned = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned = $true }
+            if (-not $owned) { exit }
+            while ($true) {
+                try { Invoke-Heartbeat }
+                catch {
+                    Remove-HelperRoutes
+                    $_.Exception.Message | Set-Content (Join-Path $InstallDir 'last-error.txt')
+                }
+                Start-Sleep -Seconds 10
+            }
+        } finally {
+            if ($owned) { Remove-HelperRoutes; $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+        }
     }
-
-    default {
-        Write-Host "Unknown action '$Action'. Use: install | status | remove"
-        exit 1
+    'apply' { Assert-Admin; Invoke-Heartbeat }
+    'status' {
+        Assert-Admin
+        Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Select-Object TaskName, State
+        $state = Read-Json $StatePath
+        if ($state -and $state.Gateway) { Write-Host "Using laptop $($state.Gateway) on interface $($state.InterfaceIndex)" }
+        else { Write-Host 'Using original router routes (no ready laptop).' }
+        Get-Content (Join-Path $InstallDir 'last-error.txt') -ErrorAction SilentlyContinue
+    }
+    'remove' {
+        Assert-Admin
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-HelperRoutes
+        Remove-NetFirewallRule -Name 'whoson-discovery' -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $ConfigPath, $StatePath, $TaskScript -Force -ErrorAction SilentlyContinue
+        Write-Host 'Removed. Original router routes are unchanged.'
     }
 }

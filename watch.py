@@ -37,6 +37,16 @@ class Device:
     cap: tuple = None             # (down_kbit, up_kbit) or None
     associated: bool = True       # booth: actually connected to the Wi-Fi
 
+    client_id: str = ""
+    connection: str = "unknown"  # wired | wireless | unknown
+
+    download_now: float = None
+    upload_now: float = None
+    used_down: int = None
+    used_up: int = None
+    daily_limit: int = None
+    quota_exhausted: bool = False
+
     @property
     def key(self):
         # the serial number (MAC) is what makes it the same gadget, even
@@ -57,12 +67,19 @@ def booth_devices(booth) -> list:
         cap = caps.get(c["mac"]) or caps.get(c["ip"])
         out.append(Device(
             ip=c["ip"], mac=c["mac"], name=c.get("name") or "",
-            source="booth",
+            source="booth", connection="wireless",
             blocked=c["ip"] in blocked,
             cap=tuple(cap) if cap else None,
             associated=c.get("associated", True),
         ))
     return out
+
+
+def cable_devices(booth) -> list:
+    return [Device(ip=r["ip"], mac=r["mac"], name=r["name"],
+                   source="cable", connection="wired", client_id=r["client_id"],
+                   cap=tuple(r["cap"]) if r["cap"] else None)
+            for r in booth.registered_pcs()]
 
 
 def scan_devices() -> list:
@@ -116,7 +133,8 @@ class RouterPoller:
         self.status = "ok"
         self._last_rows = [
             Device(ip=r["ip"], mac=r["mac"], name=r.get("name") or "",
-                   source="router") for r in rows]
+                   source="router", connection=r.get("connection", "unknown"))
+            for r in rows]
         return self._last_rows
 
 
@@ -141,5 +159,5 @@ def diff(old: list, new: list):
 def describe(device: Device) -> str:
     """One line for the log, e.g. 'sebas-phone (10.42.0.7) via hotspot'."""
     who = device.name or makers.maker_of(device.mac)
-    where = {"booth": "my Wi-Fi", "router": "router", "scan": "scan"}[device.source]
+    where = {"booth": "my Wi-Fi", "router": "router", "scan": "scan", "cable": "paired PC"}[device.source]
     return f"{who or 'device'} ({device.ip or 'no address yet'}) via {where}"

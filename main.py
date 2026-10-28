@@ -13,19 +13,22 @@ in the log pane in plain words.
 """
 
 import queue
+from pathlib import Path
 import secrets
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
+import companion
 import makers
 import router as router_mod
 import settings
 import speeds
 import tollbooth
 import watch
+import usage
 from helpers import doctor_checks, guard_protected, validate_wifi
 from tollbooth import RunError, TollBooth
 
@@ -49,9 +52,11 @@ class Snapshotter(threading.Thread):
     """The quiet worker: checks who's online every ~2 seconds, forever,
     and drops a fresh snapshot into a queue for the window to show."""
 
-    def __init__(self, booth: TollBooth, out: queue.Queue):
+    def __init__(self, booth: TollBooth, out: queue.Queue, usage_monitor=None):
         super().__init__(daemon=True)
         self.booth = booth
+        self.usage_monitor = usage_monitor
+        self._usage_error = None
         self.out = out
         self.poller = None          # set later when a router password works
         self._prev = []
@@ -79,6 +84,7 @@ class Snapshotter(threading.Thread):
     def _one_round(self):
         now = time.time()
         devices = list(watch.booth_devices(self.booth))
+        devices += watch.cable_devices(self.booth)
         # keep asking the router (it rate-limits itself, and backs off
         # when moody) so it recovers on its own
         router_rows = self.poller.poll(now) if self.poller else []
@@ -93,6 +99,17 @@ class Snapshotter(threading.Thread):
                     self._scan_cache = []
                 self._last_scan = now
             devices += self._scan_cache
+        if self.usage_monitor is not None:
+            try:
+                self.usage_monitor.update(devices)
+                if self._usage_error:
+                    self.out.put(("error", "usage monitoring recovered"))
+                self._usage_error = None
+            except Exception as error:
+                message = str(error)
+                if message != self._usage_error:
+                    self.out.put(("error", f"usage/quota monitoring unavailable: {message}"))
+                self._usage_error = message
         joined, left = watch.diff(self._prev, devices)
         events = [("+ " + watch.describe(d)) for d in joined]
         events += [("- " + watch.describe(d)) for d in left]
@@ -122,10 +139,13 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("whoson — who's on my network?")
-        root.geometry("940x700")
+        root.geometry("1200x760")
         root.minsize(860, 560)
 
         self.cfg = settings.load()
+        if not self.cfg.get("companion_key"):
+            self.cfg["companion_key"] = secrets.token_hex(32)
+            settings.save(self.cfg)
         self.booth = TollBooth(self.cfg)
         self.updates = queue.Queue()
         self._busy = False
@@ -136,7 +156,17 @@ class App:
         self._login_try = None
         self._router_ok = False
         self._router_saved = bool(self.cfg.get("router_pass"))
-        self._snap = Snapshotter(self.booth, self.updates)
+        self._usage = None
+        usage_problem = None
+        try:
+            self._usage = usage.Monitor(Path(settings.CONFIG_DIR) / "usage.json",
+                                        usage.Kernel(self.booth.wifi),
+                                        self.cfg.get("usage_timezone", "Africa/Cairo"))
+        except (OSError, ValueError) as error:
+            usage_problem = str(error)
+        self._snap = Snapshotter(self.booth, self.updates, self._usage)
+
+        self._companion = companion.Server(self.cfg["companion_key"], self.booth, self.updates)
 
         self._build_menu()
         self._build_widgets()
@@ -145,8 +175,13 @@ class App:
         self.root.after(REFRESH_MS, self._drain)
         self._log("Welcome! Press 'Start my Wi-Fi' to open the toll booth, "
                   "then have a device join its Wi-Fi to cap or cut it.")
+        if usage_problem:
+            self._log(f"usage monitoring unavailable: {usage_problem}")
+        self._companion.start()
         self._snap.start()
         self._restore_router()
+        if self.cfg.get("lan_alias_ip"):
+            self._run(self.booth.lan_up)
 
     # -- building blocks -----------------------------------------------------
 
@@ -182,17 +217,29 @@ class App:
             self.root, anchor="w", text="router: not asked yet")
         self.router_status.pack(fill="x", padx=8)
 
-        columns = ("name", "ip", "mac", "maker", "where", "cap", "cut")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings",
+        columns = ("name", "ip", "mac", "maker", "where", "connection", "cap", "cut", "download", "upload", "used", "quota")
+        table_frame = ttk.Frame(self.root)
+        table_frame.pack(fill="both", expand=True, **pad)
+        self.tree = ttk.Treeview(table_frame, columns=columns,
+                                 displaycolumns=("name", "ip", "download", "upload", "used", "quota",
+                                                 "cap", "connection", "where", "mac", "maker", "cut"),
+                                 show="headings",
                                  height=9)
         heads = [("name", "Name", 130), ("ip", "Address", 110),
-                 ("mac", "Serial number", 140), ("maker", "Maker", 110),
-                 ("where", "Where", 90), ("cap", "Speed cap", 110),
-                 ("cut", "Cut off", 50)]
+                 ("mac", "MAC address", 140), ("maker", "Maker", 110),
+                 ("where", "Where", 90),
+                 ("connection", "Connection", 90), ("cap", "Speed cap", 110),
+                 ("cut", "Cut off", 60),
+                 ("download", "Download now", 110), ("upload", "Upload now", 110),
+                 ("used", "Used today (total; down / up)", 260),
+                 ("quota", "Daily allowance", 150)]
         for key, title, width in heads:
             self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, anchor="w")
-        self.tree.pack(fill="both", expand=True, **pad)
+            self.tree.column(key, width=width, minwidth=width, anchor="w", stretch=False)
+        scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(xscrollcommand=scroll.set)
+        scroll.pack(side="bottom", fill="x")
+        self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._remember_selection)
 
         act = ttk.LabelFrame(self.root, text="Picked device")
@@ -200,9 +247,10 @@ class App:
         picked_row = ttk.Frame(act)
         picked_row.pack(fill="x")
         ttk.Label(picked_row,
-                  text="Speed (like 100kb/20kb):").pack(side="left", **pad)
+                  text="Speed (like 50kb/10kb):").pack(side="left", **pad)
         self.speed_box = ttk.Entry(picked_row, width=14)
-        self.speed_box.insert(0, "100kb/20kb")
+        self.speed_box.insert(0, self.cfg.get("default_speed", settings.DEFAULTS["default_speed"]))
+        self.speed_box.bind("<FocusOut>", self._remember_speed)
         self.speed_box.pack(side="left", **pad)
         self.cap_btn = ttk.Button(picked_row, text="Cap speed",
                                   command=self.cap_picked)
@@ -213,6 +261,20 @@ class App:
         self.cut_btn = ttk.Button(picked_row, text="Cut internet",
                                   command=self.cut_picked)
         self.cut_btn.pack(side="left", **pad)
+
+        quota_row = ttk.Frame(act)
+        quota_row.pack(fill="x")
+        ttk.Label(quota_row, text="Daily GB (download + upload):").pack(side="left", **pad)
+        self.quota_box = ttk.Entry(quota_row, width=8)
+        self.quota_box.insert(0, self.cfg.get("default_daily_gb", "2"))
+        self.quota_box.pack(side="left", **pad)
+        self.quota_btn = ttk.Button(quota_row, text="Set daily allowance",
+                                    command=self.set_daily_allowance)
+        self.quota_btn.pack(side="left", **pad)
+        self.no_quota_btn = ttk.Button(quota_row, text="Remove daily allowance",
+                                       command=self.remove_daily_allowance)
+        self.no_quota_btn.pack(side="left", **pad)
+        ttk.Label(quota_row, text=f"Resets at midnight ({self.cfg.get('usage_timezone', 'Africa/Cairo')})").pack(side="left", **pad)
 
         all_row = ttk.Frame(act)
         all_row.pack(fill="x")
@@ -235,15 +297,9 @@ class App:
         self.lan_btn.pack(side="left", **pad)
         self.cable_status = ttk.Label(cable, text="off")
         self.cable_status.pack(side="left", **pad)
-        ttk.Label(cable, text="PC address:").pack(side="left", **pad)
-        self.pc_box = ttk.Entry(cable, width=15)
-        self.pc_box.pack(side="left", **pad)
-        self.cap_pc_btn = ttk.Button(cable, text="Cap PC",
-                                     command=self.cap_pc)
-        self.cap_pc_btn.pack(side="left", **pad)
-        self.uncap_pc_btn = ttk.Button(cable, text="Uncap PC",
-                                       command=self.uncap_pc)
-        self.uncap_pc_btn.pack(side="left", **pad)
+        self.windows_btn = ttk.Button(cable, text="Save Windows installer…",
+                                      command=self.save_windows_installer)
+        self.windows_btn.pack(side="left", **pad)
 
         log_frame = ttk.LabelFrame(self.root, text="What happened")
         log_frame.pack(fill="both", expand=True, **pad)
@@ -287,7 +343,7 @@ class App:
         values = self.tree.item(picked[0], "values")
         return (values[1], values[2])            # (address, serial number)
 
-    def _picked_device(self, key=None) -> dict:
+    def _picked_device(self, key=None, allow_cable=False) -> dict:
         """The picked row as a plain device dict.
 
         Uses the last snapshot (no window access), so this is safe to
@@ -302,7 +358,7 @@ class App:
         for d in self._last_devices:
             if (not key_ip or d.ip == key_ip) and \
                (not key_mac or d.mac == key_mac):
-                if d.source != "booth":
+                if d.source != "booth" and not (allow_cable and d.source == "cable"):
                     where = "the router's side" if d.source == "router" \
                         else "the scan list"
                     raise LookupError(
@@ -312,7 +368,8 @@ class App:
                 if not d.ip:
                     raise LookupError("that device has no address yet — give "
                                       "it a second, then try again")
-                return {"ip": d.ip, "mac": d.mac, "name": d.name}
+                return {"ip": d.ip, "mac": d.mac, "name": d.name,
+                        "source": d.source, "client_id": d.client_id, "usage_key": usage.device_key(d)}
         raise LookupError("that device left — pick another in the table")
 
     def _show_table(self, devices: list):
@@ -321,7 +378,7 @@ class App:
         rows = {}                                # iid -> (rank, values)
         for d in devices:
             where = {"booth": "my Wi-Fi 📶", "router": "router",
-                     "scan": "scan"}[d.source]
+                     "scan": "scan", "cable": "paired PC"}[d.source]
             cap = ""
             if d.cap:
                 down, up = d.cap
@@ -329,10 +386,17 @@ class App:
                                  else f"{k // 8}KB/s")
                 cap = f"{fmt(down)}↓/{fmt(up)}↑"
             iid = d.mac or d.ip or f"row-{len(rows)}"
-            rank = {"booth": 0, "router": 1, "scan": 2}[d.source]
+            rank = {"cable": 0, "booth": 1, "router": 2, "scan": 3}[d.source]
             values = (d.name or "-", d.ip or "-", d.mac or "-",
-                      makers.maker_of(d.mac), where, cap,
-                      "⛔ yes" if d.blocked else "")
+                      makers.maker_of(d.mac), where,
+                      {"wired": "Ethernet", "wireless": "Wi-Fi",
+                       "unknown": "Unknown"}.get(d.connection, "Unknown"), cap,
+                      "⛔ yes" if d.blocked else "",
+                      usage.human_bytes(d.download_now) + "/s" if d.download_now is not None else "—",
+                      usage.human_bytes(d.upload_now) + "/s" if d.upload_now is not None else "—",
+                      f"{usage.human_bytes(d.used_down+d.used_up)} (↓ {usage.human_bytes(d.used_down)} / ↑ {usage.human_bytes(d.used_up)})" if d.used_down is not None else "—",
+                      (usage.human_bytes(d.daily_limit) + (" — reached" if d.quota_exhausted else "/day"))
+                      if d.daily_limit else ("Unlimited" if d.used_down is not None else "—"))
             # the same gadget can show up in two lists; keep the best row
             if iid not in rows or rank < rows[iid][0]:
                 rows[iid] = (rank, values)
@@ -427,8 +491,8 @@ class App:
     def _set_busy_buttons(self, state):
         for btn in (self.start_btn, self.wifi_btn, self.cap_btn,
                     self.uncap_btn, self.cut_btn, self.cap_all_btn,
-                    self.cap_rest_btn, self.lan_btn, self.cap_pc_btn,
-                    self.uncap_pc_btn):
+                    self.cap_rest_btn, self.lan_btn,
+                    self.windows_btn, self.quota_btn, self.no_quota_btn):
             btn.config(state=state)
 
     def _run(self, fn, ok_message=None):
@@ -452,9 +516,22 @@ class App:
     def _read_speed(self) -> tuple:
         """Only ever called on the window's thread (Tk isn't thread-safe)."""
         try:
-            return speeds.parse_speed(self.speed_box.get())
+            result = speeds.parse_speed(self.speed_box.get())
+            self._remember_speed()
+            return result
         except ValueError as e:
             raise ValueError(f"that speed didn't make sense: {e}")
+
+    def _remember_speed(self, _event=None):
+        value = self.speed_box.get().strip()
+        try:
+            speeds.parse_speed(value)
+            if value != self.cfg.get("default_speed"):
+                self.cfg["default_speed"] = settings.remember_speed(value)
+        except ValueError:
+            pass  # incomplete edits never replace the last valid preference
+        except OSError as error:
+            self._log(f"couldn't remember the speed: {error}")
 
     def _speed_or_complain(self):
         try:
@@ -572,20 +649,26 @@ class App:
         key = self._current_selection()
 
         def action():
+            target = self._picked_device(key, allow_cable=True)
+            guard_protected(self.booth, target["ip"])
+            if target["source"] == "cable":
+                if not self.booth.lan_alias():
+                    raise RunError("turn cable mode on first")
+                return self.booth.lan_cap(target["ip"], down, up,
+                                          client_id=target["client_id"])
             if not self.booth.is_up():
                 raise RunError("my Wi-Fi isn't on — press 'Start my Wi-Fi' first")
-            target = self._picked_device(key)
-            guard_protected(self.booth, target["ip"])
-            return self.booth.cap(target["ip"], down, up,
-                                  mac=target.get("mac", ""))
+            return self.booth.cap(target["ip"], down, up, mac=target["mac"])
         self._run(action)
 
     def uncap_picked(self):
         key = self._current_selection()
 
         def action():
-            target = self._picked_device(key)
-            return self.booth.uncap(target["ip"], mac=target.get("mac", ""))
+            target = self._picked_device(key, allow_cable=True)
+            if target["source"] == "cable":
+                return self.booth.lan_uncap(target["ip"], client_id=target["client_id"])
+            return self.booth.uncap(target["ip"], mac=target["mac"])
         self._run(action)
 
     def cut_picked(self):
@@ -600,6 +683,41 @@ class App:
             if blocked:
                 return self.booth.unblock(target["ip"])
             return self.booth.block(target["ip"])
+        self._run(action)
+
+    def set_daily_allowance(self):
+        try:
+            limit = usage.parse_gb(self.quota_box.get().strip())
+        except ValueError as error:
+            self._log(str(error))
+            return
+        key = self._current_selection()
+        value = self.quota_box.get().strip()
+
+        def action():
+            if self._usage is None:
+                raise RunError("usage monitoring is unavailable — check the log")
+            target = self._picked_device(key, allow_cable=True)
+            guard_protected(self.booth, target["ip"])
+            self._usage.set_limit(target["usage_key"], limit)
+            cfg = settings.load()
+            cfg["default_daily_gb"] = value
+            settings.save(cfg)
+            self.cfg["default_daily_gb"] = value
+            return (f"Daily allowance saved for {target['name'] or target['ip']}: "
+                    f"{usage.human_bytes(limit)} combined download/upload. "
+                    f"Applies on the next refresh; resets at midnight {self.cfg.get('usage_timezone', 'Africa/Cairo')}.")
+        self._run(action)
+
+    def remove_daily_allowance(self):
+        key = self._current_selection()
+
+        def action():
+            if self._usage is None:
+                raise RunError("usage monitoring is unavailable — check the log")
+            target = self._picked_device(key, allow_cable=True)
+            self._usage.set_limit(target["usage_key"], None)
+            return "Daily allowance removed; access returns on the next refresh. Usage totals are kept."
         self._run(action)
 
     def cap_everyone(self):
@@ -648,25 +766,21 @@ class App:
             return self.booth.lan_up("")
         self._run(action)
 
-    def cap_pc(self):
-        speed = self._speed_or_complain()
-        if speed is None:
+    def save_windows_installer(self):
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save Windows installer to your flash drive",
+            initialfile="whoson-install.cmd", defaultextension=".cmd",
+            filetypes=[("Windows installer", "*.cmd")])
+        if not path:
             return
-        down, up = speed
-        ip = self.pc_box.get().strip()
-
-        def action():
-            return self.booth.lan_cap(ip, down, up)
-        self._run(action)
-
-    def uncap_pc(self):
-        ip = self.pc_box.get().strip()
-
-        def action():
-            return self.booth.lan_uncap(ip)
-        self._run(action)
-
-    # -- menu actions ----------------------------------------------------------
+        try:
+            companion.save_installer(path, self.cfg["companion_key"])
+            self._log("Windows installer saved. Copy whoson-install.cmd to "
+                      "the Windows PC, double-click it, and accept the admin "
+                      "prompt once. Setup is automatic after that. "
+                      "Keep this file private — it is paired with this laptop.")
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Windows setup", str(error), parent=self.root)
 
     def _remember_router(self, user: str, password: str, remember: bool):
         """Save the router password and show whether it really stuck."""
@@ -878,6 +992,8 @@ class App:
     # -- shutdown ---------------------------------------------------------------
 
     def on_close(self):
+        self._remember_speed()
+        self._companion.stop()
         self._snap.stop()
         self.root.destroy()
 

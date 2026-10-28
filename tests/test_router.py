@@ -71,7 +71,20 @@ class TestDeviceNormalization(unittest.TestCase):
         dev = router._normalize_device(rows[0])
         self.assertEqual(dev, {"ip": "192.168.1.24",
                                "mac": "aa:bb:cc:11:22:33",
-                               "name": "Sebas-Phone"})
+                               "name": "Sebas-Phone", "connection": "unknown"})
+
+    def test_connection_from_captured_router_interfaces(self):
+        import json
+        rows = json.loads(fixture("host_info.json"))
+        self.assertEqual([router._normalize_device(r)["connection"]
+                          for r in rows[:3]], ["wireless", "wired", "wireless"])
+
+    def test_unknown_interface_is_not_assumed_wired(self):
+        for row in ({}, {"Layer2Interface": "other", "WlanActive": False},
+                    {"HostName": "my-pc-Ethernet"}):
+            with self.subTest(row=row):
+                self.assertEqual(router._normalize_device(row)["connection"],
+                                 "unknown")
 
     def test_extract_rows_finds_the_list(self):
         self.assertEqual(router._extract_rows({"hosts": [{"ip": "1.2.3.4"}]}),

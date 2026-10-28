@@ -158,6 +158,15 @@ def forwarding_on_cmds() -> list:
     return [["sysctl", "-q", "-w", "net.ipv4.ip_forward=1"]]
 
 
+def lan_forwarding_cmds(iface: str) -> list:
+    # A one-interface gateway must not tell clients to bypass it via
+    # ICMP redirects to the router on that same Ethernet/Wi-Fi segment.
+    return forwarding_on_cmds() + [
+        ["sysctl", "-q", "-w", "net/ipv4/conf/all/send_redirects=0"],
+        ["sysctl", "-q", "-w", f"net/ipv4/conf/{iface}/send_redirects=0"],
+    ]
+
+
 def nat_cmds(ap_iface: str = "ap0") -> list:
     """One-to-many address sharing (NAT) in our own firewall table.
 

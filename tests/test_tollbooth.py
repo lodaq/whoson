@@ -190,7 +190,8 @@ class TestCableMode(unittest.TestCase):
         with patch.object(tollbooth, "run", side_effect=self._fake_run), \
              patch.object(tollbooth, "sudo_available", return_value=True), \
              patch.object(tollbooth.settings, "load", return_value={}), \
-             patch.object(tollbooth.settings, "save") as save:
+             patch.object(tollbooth.settings, "save") as save, \
+             patch.object(g, "lan_alias", return_value="192.168.1.253"):
             g.lan_up("192.168.1.253")
         self.assertIn("nft add table inet whoson", self.issued)
         self.assertTrue(any("ip addr add 192.168.1.253/24" in c
@@ -263,3 +264,53 @@ class TestCableMode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestRegisteredPCs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.booth = tollbooth.TollBooth({'router_ip': '192.168.1.1'})
+        self.booth.LAN_CAPS_PATH = os.path.join(self.tmp.name, 'caps.json')
+        self.booth._lan_ready = True
+        self.client = '12' * 16
+
+    def test_registration_prepares_nat_and_caps_follow_pc_address_changes(self):
+        with patch.object(self.booth, 'lan_alias', return_value='192.168.1.253'), \
+             patch.object(tollbooth.scanner, 'autodetect_subnet', return_value='192.168.1.0/24'), \
+             patch.object(tollbooth, 'run', return_value='') as runner:
+            self.assertEqual(self.booth.register_pc(self.client, '192.168.1.5', 'PC', 'aa:bb:cc:dd:ee:ff'),
+                             '192.168.1.253')
+            self.assertTrue(any('masquerade' in call.args[0] for call in runner.call_args_list))
+            self.booth.lan_cap('192.168.1.5', 800, 160, client_id=self.client)
+            runner.reset_mock()
+            self.booth.register_pc(self.client, '192.168.1.8', 'PC', 'aa:bb:cc:dd:ee:ff')
+            calls = [call.args[0] for call in runner.call_args_list]
+            filters = [c for c in calls if 'u32' in c]
+            self.assertTrue(any('192.168.1.8' in c for c in filters))
+            self.assertFalse(any('192.168.1.5' in c for c in filters))
+            self.assertEqual(self.booth.lan_caps()[f'pc-{self.client}'], [800, 160])
+            self.booth.lan_uncap('192.168.1.8', client_id=self.client)
+            self.assertTrue(any('masquerade' in call.args[0] for call in runner.call_args_list))
+
+    def test_expired_client_loses_old_address_rules_but_keeps_saved_cap(self):
+        with patch.object(self.booth, 'lan_alias', return_value='192.168.1.253'), \
+             patch.object(tollbooth.scanner, 'autodetect_subnet', return_value='192.168.1.0/24'), \
+             patch.object(tollbooth, 'run', return_value='') as runner:
+            self.booth.register_pc(self.client, '192.168.1.5', 'PC', 'aa:bb:cc:dd:ee:ff')
+            self.booth.lan_cap('192.168.1.5', 800, 160, client_id=self.client)
+            self.booth._pcs[self.client]['seen'] -= 46
+            runner.reset_mock()
+            self.booth.expire_pcs()
+            self.assertEqual(self.booth.registered_pcs(), [])
+            self.assertIn(f'pc-{self.client}', self.booth.lan_caps())
+            self.assertFalse(any('192.168.1.5' in call.args[0] for call in runner.call_args_list))
+
+    def test_not_ready_or_off_subnet_never_registers(self):
+        self.booth._lan_ready = False
+        self.assertEqual(self.booth.register_pc(self.client, '192.168.1.5', 'PC', 'aa:bb:cc:dd:ee:ff'), '')
+        self.booth._lan_ready = True
+        with patch.object(self.booth, 'lan_alias', return_value='192.168.1.253'), \
+             patch.object(tollbooth.scanner, 'autodetect_subnet', return_value='192.168.1.0/24'):
+            self.assertEqual(self.booth.register_pc(self.client, '10.0.0.5', 'PC', 'aa:bb:cc:dd:ee:ff'), '')
+            self.assertEqual(self.booth.register_pc(self.client, '192.168.1.1', 'PC', 'aa:bb:cc:dd:ee:ff'), '')
+        self.assertEqual(self.booth.registered_pcs(), [])

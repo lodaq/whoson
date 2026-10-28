@@ -12,6 +12,19 @@ def dev(**kw):
     return Device(**kw)
 
 
+class TestConnectionInfo(unittest.TestCase):
+    def test_router_connection_reaches_device_model(self):
+        class Client:
+            def devices(self):
+                return [{"ip": "192.168.1.5", "mac": "aa:bb:cc:dd:ee:ff",
+                         "connection": "wired"}]
+        self.assertEqual(watch.RouterPoller(Client()).poll(1000)[0].connection,
+                         "wired")
+
+    def test_scan_connection_is_unknown(self):
+        self.assertEqual(dev().connection, "unknown")
+
+
 class TestDiff(unittest.TestCase):
     def test_join_and_leave(self):
         old = [dev(), dev(ip="10.42.0.8", mac="aa:bb:cc:00:00:02")]

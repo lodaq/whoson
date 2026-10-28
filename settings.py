@@ -10,10 +10,15 @@ import json
 import os
 import stat
 
+import speeds
+
 CONFIG_DIR = os.path.expanduser("~/.config/whoson")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULTS = {
+    "default_daily_gb": "2",
+    "usage_timezone": "Africa/Cairo",
+    "default_speed": "50kb/10kb",
     "router_ip": "192.168.1.1",
     "router_user": "admin",
     "router_pass": None,      # asked on first run, then stored
@@ -29,6 +34,10 @@ def load() -> dict:
             cfg.update(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    try:
+        speeds.parse_speed(cfg["default_speed"])
+    except (ValueError, TypeError):
+        cfg["default_speed"] = DEFAULTS["default_speed"]
     return cfg
 
 
@@ -46,3 +55,13 @@ def forget_password() -> None:
     cfg = load()
     cfg["router_pass"] = None
     save(cfg)
+
+
+def remember_speed(value: str) -> str:
+    """Persist a valid preference, preserving other saved settings."""
+    value = value.strip()
+    speeds.parse_speed(value)
+    cfg = load()
+    cfg["default_speed"] = value
+    save(cfg)
+    return value

@@ -212,7 +212,7 @@ class RouterClient:
         return found
 
     def devices(self) -> list:
-        """All live devices the router sees: [{ip, mac, name}, ...].
+        """All live devices with addresses, names, and connection types.
 
         Tries the LAN-devices page's own data sources first (discovered
         live from the router), with well-known names from this router
@@ -289,10 +289,18 @@ def _is_active(rec: dict) -> bool:
 def _normalize_device(rec: dict) -> dict:
     name = str(_pick(rec, "hostname", "devicename", "name", "username",
                      "actualname"))
-    # this firmware appends how the device is attached; the table already
-    # has a "Where" column, so keep the name itself
+    # Keep attachment metadata separate from the display name.
     name = re.sub(r"-(Wireless|Ethernet|Wired)$", "", name)
+    # Use the explicit interface, never the hostname or the generic
+    # domain field (this firmware uses Ethernet domains even for WLAN).
+    interface = str(_pick(rec, "layer2interface")).strip().upper()
+    connection = "unknown"
+    if interface == "WLAN":
+        connection = "wireless"
+    elif re.fullmatch(r"LAN[0-9]+", interface) or interface == "ETHERNET":
+        connection = "wired"
     return {
+        "connection": connection,
         "ip": str(_pick(rec, "ipaddress", "ip", "ipaddr")),
         "mac": str(_pick(rec, "macaddress", "mac", "macaddr")).lower(),
         "name": name,

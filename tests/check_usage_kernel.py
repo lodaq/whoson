@@ -7,6 +7,8 @@ import subprocess
 import time
 
 import usage
+import commands
+import tollbooth
 
 
 def run(*args):
@@ -72,6 +74,22 @@ try:
     kernel.install(devices, records, kernel.read(), reset=True)
     assert sum(kernel.read().values()) == 0
     assert ping(1).returncode == 0, 'new day should restore access'
+    # Manual cuts share the cable-mode forwarding firewall and must work
+    # without ever creating hotspot-specific input/isolation rules.
+    records[key]['limit'] = 100000
+    kernel.install(devices, records, kernel.read())
+    tollbooth.ensure_forward_blocking()
+    tollbooth.ensure_forward_blocking()
+    table = run('nft', 'list', 'table', 'inet', 'whoson')
+    assert table.count('ip saddr @blocked_v4 drop') == 1, table
+    assert 'chain input' not in table, table
+    for command in commands.nft_block_cmds('10.42.0.7'):
+        run(*command)
+    assert ping(1).returncode != 0, 'manual cut must drop forwarded traffic'
+    for command in commands.nft_unblock_cmds('10.42.0.7'):
+        run(*command)
+    assert ping(1).returncode == 0, 'undoing manual cut must restore traffic'
+    print('PASS: standalone forwarding cut/restore and idempotent firewall initialization.')
     print('PASS: real upload/download counting, combined quota blocking, allowance increase and daily reset.')
 finally:
     for process in (pc, wan):

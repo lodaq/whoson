@@ -6,11 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "whoson"
 version = "0.2.0"
 description = "Who's on my network? A simple window that shows every device live, and caps the speed of the ones that join the laptop's Wi-Fi."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
+dependencies = ["ttkbootstrap>=2.2.6,<3", "Pillow>=13,<14"]
 
 [tool.setuptools]
-py-modules = ["main", "helpers", "companion", "usage", "tollbooth", "commands", "watch",
+py-modules = ["main", "ui", "helpers", "companion", "usage", "tollbooth", "commands", "watch",
               "router", "scanner", "makers", "settings", "speeds"]
 
 [tool.setuptools.data-files]
-"share/whoson/windows" = ["windows/point-to-laptop.ps1"]
+"share/whoson/resources" = ["resources/point-to-laptop.ps1"]

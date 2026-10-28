@@ -3,3 +3,22 @@ __pycache__/
 build/
 dist/
 *.egg-info
+
+.venv/
+
+# Private generated Windows installers contain this laptop's pairing key.
+/windows/*.cmd
+/whoson-install*.cmd
+.zcode/
+
+# Local credentials, runtime state and private exports.
+.env
+.env.*
+config.json
+companion.json
+usage.json
+caps.json
+lan_caps.json
+hostapd.conf
+*.key
+*.pem

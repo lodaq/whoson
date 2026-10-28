@@ -48,8 +48,8 @@ class TestCsrfParsing(unittest.TestCase):
     def test_tokens_from_the_real_login_page(self):
         html = fixture("login_page.html")
         param, token = router.parse_csrf(html)
-        self.assertEqual(param, "Ze3rbL2mwzeBhvu8PWlwtQPf0sxF83G")
-        self.assertEqual(token, "RjdnpQuC70EygZ3MLz2CYxGB24TahcL")
+        self.assertEqual(param, "test_csrf_parameter_not_a_secret")
+        self.assertEqual(token, "test_csrf_token_not_a_secret")
 
     def test_empty_on_garbage(self):
         self.assertEqual(router.parse_csrf("<html></html>"), ("", ""))

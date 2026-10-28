@@ -29,6 +29,7 @@ import speeds
 import tollbooth
 import watch
 import usage
+import ui
 from helpers import doctor_checks, guard_protected, validate_wifi
 from tollbooth import RunError, TollBooth
 
@@ -49,12 +50,15 @@ def _address_key(ip: str):
 # ---------------------------------------------------------------------------
 
 class Snapshotter(threading.Thread):
-    """The quiet worker: checks who's online every ~2 seconds, forever,
+    """The quiet worker: checks who's online every ~1 second, forever,
     and drops a fresh snapshot into a queue for the window to show."""
 
-    def __init__(self, booth: TollBooth, out: queue.Queue, usage_monitor=None):
+    def __init__(self, booth: TollBooth, out: queue.Queue, usage_monitor=None,
+                 *, active_scan=False, router_polling=True):
         super().__init__(daemon=True)
         self.booth = booth
+        self.active_scan = active_scan
+        self.router_polling = router_polling
         self.usage_monitor = usage_monitor
         self._usage_error = None
         self.out = out
@@ -62,43 +66,75 @@ class Snapshotter(threading.Thread):
         self._prev = []
         self._last_scan = 0.0
         self._scan_cache = []
-        self._stop = threading.Event()
+        self._stopping = threading.Event()
+        self._remote_lock = threading.Lock()
+        self._remote = ([], self._discovery_status(None), True)
         self._first_round = True
         self._last_using_scan = None
 
     def stop(self):
-        self._stop.set()
+        self._stopping.set()
 
     def set_router(self, client):
         """Give me a logged-in router client (or None to go scan-only)."""
-        self.poller = watch.RouterPoller(client) if client else None
+        self.poller = watch.RouterPoller(client) if client and self.router_polling else None
 
     def run(self):
-        while not self._stop.is_set():
+        discovery = threading.Thread(target=self._remote_loop, daemon=True)
+        discovery.start()
+        while not self._stopping.is_set():
             try:
                 self._one_round()
-            except Exception as e:  # never die; tell the window once
+            except Exception as e:
                 self.out.put(("error", f"background check hiccuped: {e}"))
-                self._stop.wait(5.0)
+                self._stopping.wait(1.0)
+
+    def _remote_loop(self):
+        while not self._stopping.is_set():
+            try:
+                self._collect_remote()
+            except Exception as error:
+                self.out.put(("error", f"device discovery hiccuped: {error}"))
+            self._stopping.wait(watch.BOOTH_INTERVAL)
+
+    def _discovery_status(self, poller):
+        if poller:
+            status = poller.status
+            if not self.active_scan:
+                status = status.replace("using door-knocking instead", "router list unavailable")
+                status += " · active scanning off"
+            return status
+        status = "router polling off" if not self.router_polling else \
+            "no router session (Network setup → Router password…)"
+        return status + (" · listing by door-knocking" if self.active_scan else " · active scanning off")
+
+    def _collect_remote(self):
+        """Router/scan requests may be slow; never run them on the meter loop."""
+        now = time.time()
+        poller = self.poller if self.router_polling else None
+        rows = poller.poll(now) if poller else []
+        using_scan = poller is None or poller.failures > 0
+        if using_scan:
+            rows = []
+            if self.active_scan:
+                if now - self._last_scan >= watch.SCAN_INTERVAL:
+                    try:
+                        self._scan_cache = watch.scan_devices()
+                    except Exception:
+                        self._scan_cache = []
+                    self._last_scan = now
+                rows = self._scan_cache
+        with self._remote_lock:
+            if poller is self.poller or not self.router_polling:
+                self._remote = (rows, self._discovery_status(poller), using_scan)
 
     def _one_round(self):
-        now = time.time()
+        started = time.monotonic()
         devices = list(watch.booth_devices(self.booth))
         devices += watch.cable_devices(self.booth)
-        # keep asking the router (it rate-limits itself, and backs off
-        # when moody) so it recovers on its own
-        router_rows = self.poller.poll(now) if self.poller else []
-        using_scan = self.poller is None or self.poller.failures > 0
-        if not using_scan:
-            devices += router_rows
-        else:
-            if now - self._last_scan >= watch.SCAN_INTERVAL:
-                try:
-                    self._scan_cache = watch.scan_devices()
-                except Exception:
-                    self._scan_cache = []
-                self._last_scan = now
-            devices += self._scan_cache
+        with self._remote_lock:
+            router_rows, status, using_scan = self._remote
+        devices += router_rows
         if self.usage_monitor is not None:
             try:
                 self.usage_monitor.update(devices)
@@ -123,12 +159,9 @@ class Snapshotter(threading.Thread):
         self._first_round = False
         self._last_using_scan = using_scan
         self._prev = devices
-        status = self.poller.status if self.poller else \
-            "listing by door-knocking (add the router password in the menu " \
-            "to see router-side devices too)"
         self.out.put(("snapshot", devices, events, status,
                       self.booth.is_up(), self.booth.lan_alias()))
-        self._stop.wait(watch.BOOTH_INTERVAL)
+        self._stopping.wait(max(0, watch.BOOTH_INTERVAL - (time.monotonic() - started)))
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +172,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("whoson — who's on my network?")
-        root.geometry("1200x760")
-        root.minsize(860, 560)
+        root.geometry("1280x850")
+        root.minsize(1060, 820)
 
         self.cfg = settings.load()
         if not self.cfg.get("companion_key"):
@@ -164,11 +197,13 @@ class App:
                                         self.cfg.get("usage_timezone", "Africa/Cairo"))
         except (OSError, ValueError) as error:
             usage_problem = str(error)
-        self._snap = Snapshotter(self.booth, self.updates, self._usage)
+        self._snap = Snapshotter(
+            self.booth, self.updates, self._usage,
+            active_scan=self.cfg.get("active_scan", False),
+            router_polling=self.cfg.get("router_polling", True))
 
         self._companion = companion.Server(self.cfg["companion_key"], self.booth, self.updates)
 
-        self._build_menu()
         self._build_widgets()
         self._wire_keys()
 
@@ -185,127 +220,8 @@ class App:
 
     # -- building blocks -----------------------------------------------------
 
-    def _build_menu(self):
-        menu = tk.Menu(self.root)
-        help_menu = tk.Menu(menu, tearoff=0)
-        help_menu.add_command(label="Check my computer (doctor)",
-                              command=self.show_doctor)
-        help_menu.add_command(label="Router password…",
-                              command=self.ask_router_password)
-        help_menu.add_command(label="Forget router password",
-                              command=self.forget_router_password)
-        help_menu.add_separator()
-        help_menu.add_command(label="About", command=self.show_about)
-        menu.add_cascade(label="Help", menu=help_menu)
-        self.root.config(menu=menu)
-
     def _build_widgets(self):
-        pad = dict(padx=6, pady=4)
-
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(top, text="Start my Wi-Fi",
-                                    command=self.toggle_booth)
-        self.start_btn.pack(side="left")
-        self.booth_status = ttk.Label(top, text="my Wi-Fi is off")
-        self.booth_status.pack(side="left", padx=10)
-        self.wifi_btn = ttk.Button(top, text="Wi-Fi name & password…",
-                                   command=self.ask_wifi_settings)
-        self.wifi_btn.pack(side="left")
-
-        self.router_status = ttk.Label(
-            self.root, anchor="w", text="router: not asked yet")
-        self.router_status.pack(fill="x", padx=8)
-
-        columns = ("name", "ip", "mac", "maker", "where", "connection", "cap", "cut", "download", "upload", "used", "quota")
-        table_frame = ttk.Frame(self.root)
-        table_frame.pack(fill="both", expand=True, **pad)
-        self.tree = ttk.Treeview(table_frame, columns=columns,
-                                 displaycolumns=("name", "ip", "download", "upload", "used", "quota",
-                                                 "cap", "connection", "where", "mac", "maker", "cut"),
-                                 show="headings",
-                                 height=9)
-        heads = [("name", "Name", 130), ("ip", "Address", 110),
-                 ("mac", "MAC address", 140), ("maker", "Maker", 110),
-                 ("where", "Where", 90),
-                 ("connection", "Connection", 90), ("cap", "Speed cap", 110),
-                 ("cut", "Cut off", 60),
-                 ("download", "Download now", 110), ("upload", "Upload now", 110),
-                 ("used", "Used today (total; down / up)", 260),
-                 ("quota", "Daily allowance", 150)]
-        for key, title, width in heads:
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, minwidth=width, anchor="w", stretch=False)
-        scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(xscrollcommand=scroll.set)
-        scroll.pack(side="bottom", fill="x")
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self._remember_selection)
-
-        act = ttk.LabelFrame(self.root, text="Picked device")
-        act.pack(fill="x", **pad)
-        picked_row = ttk.Frame(act)
-        picked_row.pack(fill="x")
-        ttk.Label(picked_row,
-                  text="Speed (like 50kb/10kb):").pack(side="left", **pad)
-        self.speed_box = ttk.Entry(picked_row, width=14)
-        self.speed_box.insert(0, self.cfg.get("default_speed", settings.DEFAULTS["default_speed"]))
-        self.speed_box.bind("<FocusOut>", self._remember_speed)
-        self.speed_box.pack(side="left", **pad)
-        self.cap_btn = ttk.Button(picked_row, text="Cap speed",
-                                  command=self.cap_picked)
-        self.cap_btn.pack(side="left", **pad)
-        self.uncap_btn = ttk.Button(picked_row, text="Remove cap",
-                                    command=self.uncap_picked)
-        self.uncap_btn.pack(side="left", **pad)
-        self.cut_btn = ttk.Button(picked_row, text="Cut internet",
-                                  command=self.cut_picked)
-        self.cut_btn.pack(side="left", **pad)
-
-        quota_row = ttk.Frame(act)
-        quota_row.pack(fill="x")
-        ttk.Label(quota_row, text="Daily GB (download + upload):").pack(side="left", **pad)
-        self.quota_box = ttk.Entry(quota_row, width=8)
-        self.quota_box.insert(0, self.cfg.get("default_daily_gb", "2"))
-        self.quota_box.pack(side="left", **pad)
-        self.quota_btn = ttk.Button(quota_row, text="Set daily allowance",
-                                    command=self.set_daily_allowance)
-        self.quota_btn.pack(side="left", **pad)
-        self.no_quota_btn = ttk.Button(quota_row, text="Remove daily allowance",
-                                       command=self.remove_daily_allowance)
-        self.no_quota_btn.pack(side="left", **pad)
-        ttk.Label(quota_row, text=f"Resets at midnight ({self.cfg.get('usage_timezone', 'Africa/Cairo')})").pack(side="left", **pad)
-
-        all_row = ttk.Frame(act)
-        all_row.pack(fill="x")
-        ttk.Label(all_row, text="Everyone on my Wi-Fi:").pack(side="left",
-                                                             **pad)
-        self.cap_all_btn = ttk.Button(all_row, text="Cap everyone",
-                                      command=self.cap_everyone)
-        self.cap_all_btn.pack(side="left", **pad)
-        self.cap_rest_btn = ttk.Button(
-            all_row, text="Cap everyone else (skip the picked one)",
-            command=self.cap_everyone_else)
-        self.cap_rest_btn.pack(side="left", **pad)
-
-        cable = ttk.LabelFrame(
-            self.root, text="PCs plugged into the router by cable "
-                            "(their traffic must pass through this laptop)")
-        cable.pack(fill="x", **pad)
-        self.lan_btn = ttk.Button(cable, text="Turn cable mode on",
-                                  command=self.toggle_cable)
-        self.lan_btn.pack(side="left", **pad)
-        self.cable_status = ttk.Label(cable, text="off")
-        self.cable_status.pack(side="left", **pad)
-        self.windows_btn = ttk.Button(cable, text="Save Windows installer…",
-                                      command=self.save_windows_installer)
-        self.windows_btn.pack(side="left", **pad)
-
-        log_frame = ttk.LabelFrame(self.root, text="What happened")
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.log_text = tk.Text(log_frame, height=7, state="disabled",
-                                wrap="word")
-        self.log_text.pack(fill="both", expand=True)
+        ui.build_workspace(self)
 
     def _wire_keys(self):
         self.root.bind("<Return>", lambda e: self.cap_picked())
@@ -314,6 +230,7 @@ class App:
 
     def _log(self, message: str):
         stamp = time.strftime("%H:%M:%S")
+        self.activity_status.config(text="Latest: " + str(message)[:180])
         self.log_text.config(state="normal")
         self.log_text.insert("end", f"[{stamp}] {message}\n")
         self.log_text.see("end")
@@ -322,6 +239,12 @@ class App:
     def _remember_selection(self, _event=None):
         self._selected_key = self._current_selection()
         self._refresh_cut_label()
+        picked = self.tree.selection()
+        if picked:
+            values = self.tree.item(picked[0], "values")
+            self.selection_label.config(text=f"{values[0]}\n{values[1]}")
+        else:
+            self.selection_label.config(text="Select a device in the table")
 
     def _refresh_cut_label(self):
         """Say what the button will do for the picked device."""
@@ -448,7 +371,7 @@ class App:
                         suffix = "  ·  password works (not saved)"
                     elif self._router_saved:
                         suffix = ("  ·  saved password isn't working — "
-                                  "Help → Router password…")
+                                  "Network setup → Router password…")
                     self.router_status.config(text=f"router: {status}{suffix}")
                     self.lan_btn.config(
                         text="Turn cable mode off" if lan
@@ -675,9 +598,11 @@ class App:
         key = self._current_selection()
 
         def action():
-            target = self._picked_device(key)
+            target = self._picked_device(key, allow_cable=True)
             guard_protected(self.booth, target["ip"])
-            if not self.booth.is_up():
+            if target["source"] == "cable" and not self.booth.lan_alias():
+                raise RunError("turn cable mode on first")
+            if target["source"] != "cable" and not self.booth.is_up():
                 raise RunError("my Wi-Fi isn't on — press 'Start my Wi-Fi' first")
             blocked = target["ip"] in set(self.booth.blocked())
             if blocked:
@@ -821,7 +746,7 @@ class App:
 
     def _restore_router(self):
         """Use the remembered router password, if there is one."""
-        if not self.cfg.get("router_pass"):
+        if not self.cfg.get("router_polling", True) or not self.cfg.get("router_pass"):
             return
 
         def worker():
@@ -832,13 +757,28 @@ class App:
                 client.login()
             except Exception as e:  # noqa: BLE001 — just tell the window
                 self.updates.put(("failed", "the saved router password didn't "
-                                           f"work ({e}) — Help → Router "
+                                           f"work ({e}) — Network setup → Router "
                                            "password… to try again"))
                 return
             self.updates.put(("router_ok", client,
                               self.cfg.get("router_user", "admin"),
                               self.cfg["router_pass"], False, "restore"))
         threading.Thread(target=worker, daemon=True).start()
+
+    def save_discovery_options(self):
+        """Persist next-launch options; never toggle a worker mid-request."""
+        options = {"active_scan": self.active_scan_var.get(),
+                   "router_polling": self.router_polling_var.get()}
+        try:
+            cfg = settings.load()
+            cfg.update(options)
+            settings.save(cfg)
+        except OSError as error:
+            self.discovery_status.config(text=f"Could not save discovery settings: {error}")
+            return
+        self.cfg.update(options)
+        self.discovery_status.config(text="Saved. Close and reopen whoson to apply these settings.")
+        self._log("Discovery settings saved; restart whoson to apply them.")
 
     def show_doctor(self):
         """Run the checks in the background — the router probe can take a
@@ -855,20 +795,7 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_doctor_window(self, rows):
-        win = tk.Toplevel(self.root)
-        win.title("Check my computer")
-        win.transient(self.root)
-        text = tk.Text(win, width=70, height=12, wrap="word")
-        text.pack(padx=10, pady=10)
-        text.insert("end", "Everything the toll booth needs:\n\n")
-        for name, ok, note in rows:
-            mark = "✓" if ok else "✗"
-            text.insert("end", f"  [{mark}] {name:<8} — {note}\n")
-        good = all(ok for _, ok, _ in rows)
-        text.insert("end", "\n" + ("Everything looks good!"
-                                   if good else
-                                   "Some pieces are missing — see the ✗ rows."))
-        text.config(state="disabled")
+        ui.show_computer_check(self, rows)
 
     def ask_router_password(self):
         """Small dialog: router username + password, remembered if wanted."""
@@ -977,7 +904,7 @@ class App:
         self._router_saved = False
         self._snap.set_router(None)
         self._log("router password removed from this computer — "
-                  "listing falls back to door-knocking")
+                  "automatic router login stopped")
 
     def show_about(self):
         messagebox.showinfo(

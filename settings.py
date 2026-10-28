@@ -16,6 +16,8 @@ CONFIG_DIR = os.path.expanduser("~/.config/whoson")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 DEFAULTS = {
+    "active_scan": False,     # opt-in while investigating router outages
+    "router_polling": True,   # independent of active subnet scanning
     "default_daily_gb": "2",
     "usage_timezone": "Africa/Cairo",
     "default_speed": "50kb/10kb",

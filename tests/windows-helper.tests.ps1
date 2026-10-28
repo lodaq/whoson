@@ -1,6 +1,6 @@
 # Run with pwsh -NoProfile -File tests/windows-helper.tests.ps1 (no admin/network changes).
 $ErrorActionPreference = 'Stop'
-$path = Join-Path $PSScriptRoot '../windows/point-to-laptop.ps1'
+$path = Join-Path $PSScriptRoot '../resources/point-to-laptop.ps1'
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }

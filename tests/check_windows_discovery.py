@@ -40,7 +40,7 @@ $found=Find-Whoson $config
 if(-not $found -or $found.Gateway -ne '127.0.0.2'){throw 'No authenticated gateway found'}
 Write-Host 'PASS: PowerShell broadcasts discovery, Python verifies/registers it, PowerShell ignores decoy and verifies readiness.'
 '''
-source = Path(__file__).resolve().parent.parent / 'windows' / 'point-to-laptop.ps1'
+source = Path(__file__).resolve().parent.parent / 'resources' / 'point-to-laptop.ps1'
 script = script.replace('__SCRIPT_PATH__', str(source).replace("'", "''"))
 with tempfile.NamedTemporaryFile('w',suffix='.ps1') as f:
     f.write(script);f.flush()

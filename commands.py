@@ -350,34 +350,31 @@ def lan_nat_cmds(client_ip: str, local_subnet: str = "192.168.1.0/24",
 # Firewall — nftables (blocking + laptop isolation)
 # ---------------------------------------------------------------------------
 
-def nft_init_cmds(ap_iface: str) -> list:
-    """Create our firewall table with two jobs:
-    1. isolation — hotspot clients may use the internet but NOT reach
-       the laptop itself (only DHCP and DNS, which the hotspot needs);
-    2. blocking  — addresses in the "blocked" set get no internet at
-       all, in either direction.
-    """
-    quoted = f'"{ap_iface}"'  # nft wants interface names as quoted strings
-    return [
-        ["nft", "add", "table", "inet", NFT_TABLE],
+def nft_forward_init_cmds() -> list:
+    """Shared per-address blocking, including standalone cable mode."""
+    return nft_table_cmd() + [
         ["nft", "add", "set", "inet", NFT_TABLE, BLOCKED_SET, "{ type ipv4_addr ; }"],
-        ["nft", "add", "chain", "inet", NFT_TABLE, "input",
-         "{ type filter hook input priority 0 ; policy accept ; }"],
         ["nft", "add", "chain", "inet", NFT_TABLE, "forward",
          "{ type filter hook forward priority 0 ; policy accept ; }"],
-        # isolation: hotspot clients may reach DHCP/DNS (needed to join
-        # and to resolve names) but nothing else on the laptop itself
+        ["nft", "add", "rule", "inet", NFT_TABLE, "forward",
+         "ip", "saddr", f"@{BLOCKED_SET}", "drop"],
+        ["nft", "add", "rule", "inet", NFT_TABLE, "forward",
+         "ip", "daddr", f"@{BLOCKED_SET}", "drop"],
+    ]
+
+
+def nft_init_cmds(ap_iface: str) -> list:
+    """Shared forwarding blocks plus isolation of hotspot clients."""
+    quoted = f'"{ap_iface}"'
+    return nft_forward_init_cmds() + [
+        ["nft", "add", "chain", "inet", NFT_TABLE, "input",
+         "{ type filter hook input priority 0 ; policy accept ; }"],
         ["nft", "add", "rule", "inet", NFT_TABLE, "input",
          "iifname", quoted, "udp", "dport", "{ 53, 67, 68 }", "accept"],
         ["nft", "add", "rule", "inet", NFT_TABLE, "input",
          "iifname", quoted, "tcp", "dport", "53", "accept"],
         ["nft", "add", "rule", "inet", NFT_TABLE, "input",
          "iifname", quoted, "drop"],
-        # blocking: members of the blocked set get no internet, either direction
-        ["nft", "add", "rule", "inet", NFT_TABLE, "forward",
-         "ip", "saddr", f"@{BLOCKED_SET}", "drop"],
-        ["nft", "add", "rule", "inet", NFT_TABLE, "forward",
-         "ip", "daddr", f"@{BLOCKED_SET}", "drop"],
     ]
 
 

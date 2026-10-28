@@ -4,6 +4,7 @@ import base64
 import gzip
 import re
 import unittest
+import queue
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock
@@ -45,6 +46,16 @@ class TestDiscovery(unittest.TestCase):
         self.assertIsNone(self.protocol.reply(request(), '192.168.1.5', now=NOW))
         self.assertEqual(self.booth.register_pc.call_count, 1)
 
+    def test_authenticated_clock_skew_is_reported_without_registering(self):
+        warning = Mock()
+        protocol = companion.Discovery(KEY, self.booth, on_clock_skew=warning)
+        self.assertIsNone(protocol.reply(request(timestamp=NOW-7345), '192.168.1.20', now=NOW))
+        warning.assert_called_once_with('192.168.1.20', 7345)
+        self.booth.register_pc.assert_not_called()
+        warning.reset_mock()
+        protocol.reply(request(key='cd'*32, timestamp=NOW-7345), '192.168.1.20', now=NOW)
+        warning.assert_not_called()
+
     def test_signed_request_cannot_register_a_different_source_address(self):
         self.assertIsNone(self.protocol.reply(request(), '192.168.1.8', now=NOW))
         self.booth.register_pc.assert_not_called()
@@ -68,6 +79,20 @@ class TestDiscovery(unittest.TestCase):
     def test_paste_command_rejects_untrusted_pairing_input(self):
         with self.assertRaises(ValueError):
             companion.setup_command("'; injected-code")
+
+
+class TestClockWarning(unittest.TestCase):
+    def test_warning_is_limited_per_peer_and_does_not_change_authentication(self):
+        from unittest.mock import patch
+        updates = queue.Queue()
+        server = companion.Server(KEY, Mock(), updates)
+        with patch.object(companion.time, 'monotonic', side_effect=[100, 110, 161]):
+            server._warn_clock_skew('192.168.1.20', 7345)
+            server._warn_clock_skew('192.168.1.20', 7345)
+            server._warn_clock_skew('192.168.1.20', -7345)
+        self.assertEqual(updates.qsize(), 2)
+        self.assertIn('behind', updates.get_nowait()[1])
+        self.assertIn('ahead of', updates.get_nowait()[1])
 
 
 class TestStandaloneInstaller(unittest.TestCase):

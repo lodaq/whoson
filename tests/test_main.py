@@ -56,7 +56,7 @@ def device(mac, ip, source="scan"):
 class TestSnapshotterEvents(unittest.TestCase):
     def setUp(self):
         self.out = queue.Queue()
-        self.snap = main.Snapshotter(FakeBooth(), self.out)
+        self.snap = main.Snapshotter(FakeBooth(), self.out, active_scan=True)
         self.scan = []
         for p in (patch.object(main.watch, "booth_devices", return_value=[]),
                   patch.object(main.watch, "scan_devices",
@@ -69,6 +69,7 @@ class TestSnapshotterEvents(unittest.TestCase):
     def _round(self):
         self.clock += 1000          # make the scan "due" every round
         with patch.object(main.time, "time", return_value=self.clock):
+            self.snap._collect_remote()
             self.snap._one_round()
         return self.out.get_nowait()
 
@@ -115,6 +116,95 @@ class TestSnapshotterEvents(unittest.TestCase):
         self.assertIn("door-knocking", msg[3])   # the status line tells it
 
 
+class TestDiscoveryControls(unittest.TestCase):
+    def round(self, snap):
+        with patch.object(main.watch, "BOOTH_INTERVAL", 0):
+            snap._collect_remote()
+            snap._one_round()
+        return snap.out.get_nowait()
+
+    def test_scanning_is_off_by_default_even_without_router(self):
+        snap = main.Snapshotter(FakeBooth(), queue.Queue())
+        with patch.object(main.watch, "scan_devices") as scan:
+            msg = self.round(snap)
+        scan.assert_not_called()
+        self.assertIn("scanning off", msg[3])
+
+    def test_router_failure_does_not_enable_disabled_scanning(self):
+        snap = main.Snapshotter(FakeBooth(), queue.Queue())
+        snap.poller = FakePoller([], failing=True)
+        with patch.object(main.watch, "scan_devices") as scan:
+            msg = self.round(snap)
+        scan.assert_not_called()
+        self.assertIn("scanning off", msg[3])
+
+    def test_disabled_polling_does_not_call_router(self):
+        from unittest.mock import Mock
+        snap = main.Snapshotter(FakeBooth(), queue.Queue(), router_polling=False)
+        snap.poller = Mock()
+        with patch.object(main.watch, "scan_devices") as scan:
+            msg = self.round(snap)
+        snap.poller.poll.assert_not_called()
+        scan.assert_not_called()
+        self.assertIn("polling off", msg[3])
+
+    def test_disabled_polling_skips_automatic_login(self):
+        app = main.App.__new__(main.App)
+        app.cfg = {"router_polling": False, "router_pass": "test-password"}
+        with patch.object(main.router_mod, "RouterClient") as client:
+            app._restore_router()
+        client.assert_not_called()
+
+    def test_controls_save_both_options_without_changing_other_settings(self):
+        from unittest.mock import Mock
+        app = main.App.__new__(main.App)
+        app.cfg = {"router_pass": "preserved"}
+        app.active_scan_var = Mock()
+        app.active_scan_var.get.return_value = False
+        app.router_polling_var = Mock()
+        app.router_polling_var.get.return_value = False
+        app.discovery_status = Mock()
+        app._log = Mock()
+        with patch.object(main.settings, "load", return_value=dict(app.cfg)), \
+             patch.object(main.settings, "save") as save:
+            app.save_discovery_options()
+        save.assert_called_once_with({"router_pass": "preserved", "active_scan": False, "router_polling": False})
+        self.assertFalse(app.cfg["router_polling"])
+        self.assertIn("reopen", app.discovery_status.config.call_args.kwargs["text"])
+
+    def test_local_devices_still_appear_with_both_options_off(self):
+        local = device("aa", "10.42.0.101", "booth")
+        snap = main.Snapshotter(FakeBooth(), queue.Queue(), router_polling=False)
+        with patch.object(main.watch, "booth_devices", return_value=[local]), \
+             patch.object(main.watch, "scan_devices") as scan:
+            msg = self.round(snap)
+        self.assertEqual(msg[1], [local])
+        scan.assert_not_called()
+
+    def test_slow_router_does_not_block_meter_snapshots(self):
+        import threading
+        from unittest.mock import Mock
+        entered, release = threading.Event(), threading.Event()
+        snap = main.Snapshotter(FakeBooth(), queue.Queue(), usage_monitor=Mock())
+        def slow_poll(now):
+            entered.set()
+            release.wait(2)
+            return []
+        snap.poller = Mock(poll=slow_poll, failures=0, status="ok")
+        worker = threading.Thread(target=snap._collect_remote)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            with patch.object(main.watch, "BOOTH_INTERVAL", 0):
+                snap._one_round()
+            snap.usage_monitor.update.assert_called_once()
+            self.assertEqual(snap.out.get_nowait()[0], "snapshot")
+            self.assertTrue(worker.is_alive())
+        finally:
+            release.set()
+            worker.join(2)
+
+
 class TestPairedPCActions(unittest.TestCase):
     def test_selected_pc_can_be_capped_without_hotspot_or_typed_address(self):
         from unittest.mock import Mock
@@ -134,6 +224,33 @@ class TestPairedPCActions(unittest.TestCase):
         app.booth.lan_cap.assert_called_once_with(pc.ip, 800, 160, client_id=pc.client_id)
         app.uncap_picked()
         app.booth.lan_uncap.assert_called_once_with(pc.ip, client_id=pc.client_id)
+
+    def test_cut_and_restore_paired_pc_without_hotspot(self):
+        from unittest.mock import Mock
+        app = main.App.__new__(main.App)
+        app.booth = Mock()
+        app.booth.lan_alias.return_value = "192.168.1.253"
+        app.booth.is_up.return_value = False
+        app.booth.blocked.return_value = []
+        pc = watch.Device("192.168.1.20", "aa:bb:cc:dd:ee:ff", source="cable", client_id="12" * 16)
+        app._last_devices = [pc]
+        app._selected_key = (pc.ip, pc.mac)
+        app._current_selection = lambda: app._selected_key
+        app._run = lambda action: action()
+        with patch.object(main, "guard_protected"):
+            app.cut_picked()
+            app.booth.block.assert_called_once_with(pc.ip)
+            app.booth.blocked.return_value = [pc.ip]
+            app.cut_picked()
+            app.booth.unblock.assert_called_once_with(pc.ip)
+
+    def test_paired_pc_row_reports_manual_block(self):
+        from unittest.mock import Mock
+        booth = Mock()
+        booth.blocked.return_value = ["192.168.1.20"]
+        booth.registered_pcs.return_value = [dict(ip="192.168.1.20", mac="aa:bb:cc:dd:ee:ff",
+                                                name="PC", client_id="12" * 16, cap=None)]
+        self.assertTrue(watch.cable_devices(booth)[0].blocked)
 
 
 class TestSpeedPreference(unittest.TestCase):

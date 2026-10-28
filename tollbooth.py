@@ -62,7 +62,7 @@ def run(argv, dry=False, check=True, quiet=False):
     proc = subprocess.run(argv, capture_output=True, text=True)
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip().splitlines()
-        raise RunError(f"`{' '.join(argv[:4])}...` failed: {detail[-1] if detail else 'unknown error'}")
+        raise RunError(f"`{' '.join(argv[:8])}...` failed: {detail[-1] if detail else 'unknown error'}")
     if not quiet:
         return proc.stdout
     return proc.stdout
@@ -71,6 +71,33 @@ def run(argv, dry=False, check=True, quiet=False):
 def run_many(cmds, dry=False):
     for cmd in cmds:
         run(cmd, dry=dry)
+
+
+def init_meters(interface, ifb, dry=False):
+    """Reuse our existing HTB roots: this kernel cannot change them in place.
+
+    Retaining roots also retains per-device classes and caps. Other root kinds
+    still go through the existing replace operation during initial setup.
+    """
+    existing = set()
+    if not dry:
+        for device in (interface, ifb):
+            raw = run(["tc", "-j", "qdisc", "show", "dev", device])
+            for qdisc in json.loads(raw or "[]"):
+                if qdisc.get("root") and qdisc.get("kind") == "htb" and qdisc.get("handle") == "1:":
+                    existing.add(device)
+    for command in commands.tc_init_cmds(interface, ifb):
+        if command[:3] == ["tc", "qdisc", "replace"] and "root" in command and command[4] in existing:
+            continue
+        run(command, dry=dry)
+
+
+def ensure_forward_blocking(dry=False):
+    """Create our shared block set and chain once, preserving existing blocks."""
+    if not dry and run(["nft", "-j", "list", "chain", "inet", commands.NFT_TABLE, "forward"],
+                       check=False, quiet=True):
+        return
+    run_many(commands.nft_forward_init_cmds(), dry)
 
 
 def sudo_available() -> bool:
@@ -236,7 +263,7 @@ class TollBooth:
         if not self.dry and subprocess.run(["ip", "link", "show", IFB],
                                            capture_output=True).returncode != 0:
             raise RunError("could not create the upload-meter device (ifb0)")
-        run_many(commands.tc_init_cmds(AP_IFACE, IFB), self.dry)
+        init_meters(AP_IFACE, IFB, self.dry)
         run_many(commands.nft_init_cmds(AP_IFACE), self.dry)
         run_many(commands.nat_cmds(AP_IFACE), self.dry)
         if not self.dry:
@@ -326,7 +353,7 @@ class TollBooth:
         # shared upload meter; cable mode (if in use) must get its own
         # rules back, or cabled PCs lose internet
         if not self.dry and (self._lan_ready or self._lan_caps_load()):
-            run_many(commands.tc_init_cmds(self.wifi, LAN_IFB), self.dry)
+            init_meters(self.wifi, LAN_IFB, self.dry)
             self.lan_reapply()
         return ("Toll booth stopped. Speed caps and blocks on the hotspot "
                 "are gone; devices that were on it will drift back to the "
@@ -537,7 +564,7 @@ class TollBooth:
         # never slowed — only filtered flows (the PCs) get buckets
         for cmd in commands.ifb_setup_cmds(LAN_IFB):
             run(cmd, dry=self.dry, check=False)
-        run_many(commands.tc_init_cmds(self.wifi, LAN_IFB), self.dry)
+        init_meters(self.wifi, LAN_IFB, self.dry)
         if not self.dry:
             self.lan_reapply()
             if not self.lan_alias():
@@ -646,6 +673,7 @@ class TollBooth:
         """Rebuild NAT for all registered PCs, including uncapped ones."""
         caps = self._lan_caps_load()
         local_subnet = scanner.autodetect_subnet()
+        ensure_forward_blocking(self.dry)
         resolved = {}
         clients = self.registered_pcs()
         for key, cap in caps.items():
@@ -710,12 +738,10 @@ class TollBooth:
         return "Cable mode off. Windows helpers return to their original router routes."
 
     def block(self, ip: str) -> str:
+        ensure_forward_blocking(self.dry)
         run_many(commands.nft_block_cmds(ip), self.dry)
-        return (f"blocked {ip} on this hotspot — its internet is cut until "
-                "you press Unblock. (A device can still leave this Wi-Fi and "
-                "rejoin the router's; blocking there needs the router's own "
-                "parental control.)")
+        return f"Internet cut for {ip} while its traffic passes through this laptop."
 
     def unblock(self, ip: str) -> str:
         run_many(commands.nft_unblock_cmds(ip), self.dry)
-        return f"unblocked {ip} on this hotspot"
+        return f"Internet restored for {ip}."

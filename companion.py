@@ -19,10 +19,11 @@ PORT = 47831
 
 
 class Discovery:
-    def __init__(self, key, booth):
+    def __init__(self, key, booth, on_clock_skew=None):
         self.key = bytes.fromhex(key)
         self.booth = booth
         self.seen = {}
+        self.on_clock_skew = on_clock_skew
 
     def reply(self, raw, peer_ip, now=None):
         now = time.time() if now is None else now
@@ -35,7 +36,12 @@ class Discovery:
             if not hmac.compare_digest(signature, expected):
                 return None
             kind, version, stamp, nonce, client, name, mac, client_ip = body.split('|')
-            if kind != 'discover' or version != '1' or abs(now-int(stamp)) > 60:
+            if kind != 'discover' or version != '1':
+                return None
+            skew = now - int(stamp)
+            if abs(skew) > 60:
+                if self.on_clock_skew is not None:
+                    self.on_clock_skew(peer_ip, round(skew))
                 return None
             if not all(re.fullmatch(r'[a-f0-9]{32}', v) for v in (nonce, client)):
                 return None
@@ -65,9 +71,20 @@ class Discovery:
 class Server(threading.Thread):
     def __init__(self, key, booth, updates):
         super().__init__(daemon=True)
-        self.protocol = Discovery(key, booth)
+        self._clock_warnings = {}
+        self.protocol = Discovery(key, booth, on_clock_skew=self._warn_clock_skew)
         self.updates = updates
         self.stopping = threading.Event()
+
+    def _warn_clock_skew(self, peer_ip, seconds):
+        now = time.monotonic()
+        if now - self._clock_warnings.get(peer_ip, float('-inf')) < 60:
+            return
+        self._clock_warnings[peer_ip] = now
+        direction = "behind" if seconds > 0 else "ahead of"
+        self.updates.put(("error", f"Windows PC {peer_ip} cannot pair: its clock is "
+                          f"{abs(seconds)} seconds {direction} this laptop. "
+                          "On Windows, open Date & time settings and click Sync now."))
 
     def stop(self):
         self.stopping.set()
@@ -105,9 +122,9 @@ def setup_command(key):
     """
     if not re.fullmatch(r'[a-f0-9]{64}', key):
         raise ValueError('invalid pairing key')
-    source = Path(__file__).parent / 'windows'
+    source = Path(__file__).parent / 'resources'
     if not source.is_dir():
-        source = Path(sys.prefix) / "share" / "whoson" / "windows"
+        source = Path(sys.prefix) / "share" / "whoson" / "resources"
     script = (source / 'point-to-laptop.ps1').read_text(encoding='utf-8-sig')
     script = script.replace('__WHOSON_PAIRING_KEY__', key)
     payload = base64.b64encode(gzip.compress(script.encode('utf-8-sig'), mtime=0)).decode('ascii')

@@ -23,7 +23,7 @@ import scanner
 
 ROUTER_INTERVAL = 12.0     # seconds between polite asks of the router
 ROUTER_MAX_INTERVAL = 60.0
-BOOTH_INTERVAL = 2.0       # toll-booth devices are cheap to check — fast
+BOOTH_INTERVAL = 1.0       # toll-booth devices are cheap to check — fast
 SCAN_INTERVAL = 10.0       # door-knocking takes a few seconds — gentler pace
 
 
@@ -76,8 +76,10 @@ def booth_devices(booth) -> list:
 
 
 def cable_devices(booth) -> list:
+    blocked = set(booth.blocked())
     return [Device(ip=r["ip"], mac=r["mac"], name=r["name"],
                    source="cable", connection="wired", client_id=r["client_id"],
+                   blocked=r["ip"] in blocked,
                    cap=tuple(r["cap"]) if r["cap"] else None)
             for r in booth.registered_pcs()]
 

@@ -9,8 +9,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="description" content="">
 <meta name="author" content="">
-<meta name="csrf_param" content="Ze3rbL2mwzeBhvu8PWlwtQPf0sxF83G"/>
-<meta name="csrf_token" content="RjdnpQuC70EygZ3MLz2CYxGB24TahcL"/>
+<meta name="csrf_param" content="test_csrf_parameter_not_a_secret"/>
+<meta name="csrf_token" content="test_csrf_token_not_a_secret"/>
 <title>HG630 V2 Home Gateway HG630 V2</title>
 <link type="text/css" href="/css/cat_public.css.cgz?HG630 V2HG630V2V100R001C105B0251234567890" rel="stylesheet"><link type="text/css" href="/css/login.css.cgz?HG630 V2HG630V2V100R001C105B0251234567890" rel="stylesheet">
 <!--[if lt IE 9]>
@@ -48,8 +48,8 @@ var g_Menus = [{"ID":"home", "Page":"/html/wizard/wizard.html", "Children":[{"ID
                 <div class="setconfig_height rounddiv_index paddingbottom_10" align="center">
                     <div class="width_100p height_120 index_login_top_back rounddiv_index_top">&nbsp;</div>
                     <div id="login_window" class="width_500 min_height_300 margintop_n50 index_page_us_ps_div rounddiv"></div>
-            		<div id="gate_info" class="clearboth accordion width_500 margintop_30 marginbottom_15 rounddiv"></div>
-		        </div>
+                    <div id="gate_info" class="clearboth accordion width_500 margintop_30 marginbottom_15 rounddiv"></div>
+                </div>
                 <!--output window-->
                 <div id="firstTimeLogin"></div>
                 <div id="loginblank" class="loginshadow hide"></div>
@@ -105,7 +105,7 @@ $(document).ready(function() {
 
     var productname = Em.I18n.t("Menu.product.name");
     if("" != productname){
-        document.title = productname; 
+        document.title = productname;
         $("#width_product_title").text(productname);
     }
 
